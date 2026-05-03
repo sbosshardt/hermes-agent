@@ -86,7 +86,7 @@ def _check_local_runtime() -> tuple[bool, str | None]:
     a broken local memory backend.
     """
     try:
-        importlib.import_module("hindsight")
+        importlib.import_module("hindsight_embed")
         importlib.import_module("hindsight_embed.daemon_embed_manager")
         return True, None
     except Exception as exc:
