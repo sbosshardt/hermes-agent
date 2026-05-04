@@ -6025,12 +6025,12 @@ class GatewayRunner:
             logger.warning("Manual compress failed: %s", e)
             return f"Compression failed: {e}"
 
-    def _make_title_rename_callback(self, source: SessionSource):
+    def _make_title_rename_callback(self, source: SessionSource, loop=None):
         """Return a (session_id, title) callback that renames a Telegram forum topic.
 
         Returns None if the platform is not Telegram, the source has no thread_id,
         or auto_rename_topics is disabled.  The callback is thread-safe — it
-        schedules the async rename on the running event loop via
+        schedules the async rename on the gateway event loop via
         call_soon_threadsafe.
         """
         from gateway.config import Platform as _Platform
@@ -6047,7 +6047,14 @@ class GatewayRunner:
             return None
 
         import asyncio
-        _loop = asyncio.get_running_loop()
+        _loop = loop
+        if _loop is None:
+            try:
+                _loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # _run_agent executes in a worker thread (run_sync) with no
+                # running event loop; callers should pass the gateway loop.
+                return None
         chat_id = int(source.chat_id)
         thread_id = int(source.thread_id)
 
@@ -8624,7 +8631,7 @@ class GatewayRunner:
                     all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []
                     # Build an on_title_set callback that renames the Telegram
                     # forum topic when auto_rename_topics is enabled.
-                    _title_callback = self._make_title_rename_callback(source)
+                    _title_callback = self._make_title_rename_callback(source, loop=_loop_for_step)
                     maybe_auto_title(
                         self._session_db,
                         effective_session_id,
@@ -8633,8 +8640,8 @@ class GatewayRunner:
                         all_msgs,
                         on_title_set=_title_callback,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Auto-title hook skipped: %s", e)
 
             return {
                 "final_response": final_response,
