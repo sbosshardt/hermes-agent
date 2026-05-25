@@ -154,6 +154,31 @@ class TestGenerateTitle:
 
 
 
+    def test_rewrites_conversational_openers_from_model_output(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "I'd like for you to prepare to update Hermes Agent"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            title = generate_title(
+                "I'd like for you to prepare to update Hermes Agent. Let me know key changes."
+            )
+
+        # Should use a concise topic phrase, not the original conversational opener.
+        assert title == "prepare to update Hermes Agent. Let"
+
+    def test_conversational_output_without_usable_fallback_still_returns_text(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Can you"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            title = generate_title("Can you")
+
+        # Fallback cannot infer a useful topic from just "Can you", so we keep
+        # the model output instead of returning None.
+        assert title == "Can you"
+
 
 class TestAutoTitleSession:
     """Tests for auto_title_session() — the sync worker function."""

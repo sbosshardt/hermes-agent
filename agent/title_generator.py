@@ -166,6 +166,73 @@ def _title_language() -> str:
     except Exception:
         return ""
 
+_CONVERSATIONAL_TITLE_PREFIXES = re.compile(
+    r"^(can you|could you|would you|please|i(?:'d|\s+would)?\s+like(?:\s+for\s+you)?|i\s+need|let\s+us|let's)\b",
+    re.IGNORECASE,
+)
+
+
+def _derive_fallback_title_from_user_message(user_message: str) -> Optional[str]:
+    """Create a short topic label from the first user message.
+
+    This is only used when model output looks like a conversational opener
+    (e.g. "Can you come up...") instead of a topic label.
+    """
+    if not user_message:
+        return None
+    text = re.sub(r"\s+", " ", str(user_message)).strip()
+    if not text:
+        return None
+
+    # Remove common request lead-ins to reveal the actual topic.
+    text = re.sub(
+        r"^(can you|could you|would you|please|i(?:'d|\s+would)?\s+like(?:\s+for\s+you)?\s+to|i\s+need\s+you\s+to|i\s+need\s+to|let\s+us|let's)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = text.strip(" .,:;!?\"'()[]{}")
+    if not text:
+        return None
+
+    words = text.split()
+    if not words:
+        return None
+
+    # Keep labels short and stable.
+    candidate = " ".join(words[:6]).strip()
+    if not candidate:
+        return None
+    if len(candidate) > 80:
+        candidate = candidate[:77].rstrip() + "..."
+    return candidate
+
+
+def _normalize_title_candidate(title: str, user_message: str) -> Optional[str]:
+    """Normalize model-generated title and guard against low-quality openers."""
+    cleaned = (title or "").strip()
+    cleaned = cleaned.strip('\"\'')
+    if cleaned.lower().startswith("title:"):
+        cleaned = cleaned[6:].strip()
+
+    # A title is one line. If a model answers the prompt with a transcript or
+    # bulleted plan, keep the first non-empty line before applying quality
+    # checks and length limits.
+    cleaned = next((line.strip() for line in cleaned.splitlines() if line.strip()), "")
+
+    if not cleaned:
+        return None
+
+    # Replace conversational/opening-phrase outputs with a topic label fallback.
+    if _CONVERSATIONAL_TITLE_PREFIXES.match(cleaned):
+        fallback = _derive_fallback_title_from_user_message(user_message)
+        cleaned = fallback or cleaned
+
+    if len(cleaned) > 80:
+        cleaned = cleaned[:77].rstrip() + "..."
+
+    return cleaned or None
+
 
 def _auto_title_enabled() -> bool:
     """Return whether automatic session title generation is enabled."""
@@ -413,14 +480,16 @@ def generate_title(
         )
         content = response.choices[0].message.content or ""
         title = _clean_title(_extract_title_text(content))
+        # The structured title response normally gives a concise topic label,
+        # but some providers still return a request-shaped opener. Retain the
+        # local fallback without bypassing the target JSON/think cleanup path.
+        if title is not None and _CONVERSATIONAL_TITLE_PREFIXES.match(title):
+            fallback = _derive_fallback_title_from_user_message(user_message)
+            if fallback:
+                title = _clean_title(fallback) or title
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
-        # with many words is a model that ignored the task and answered
-        # the user's message instead ("I don't have context on X — that's
-        # not something I recognize..."). Truncating would store half an
-        # assistant blob as the session title, which is still an assistant
-        # blob — reject instead so the caller retries on the next exchange
-        # (maybe_auto_title fires for the first two exchanges).
-        # Port of can1357/oh-my-pi#7306.
+        # with many words is a model that ignored the task and answered the
+        # user's message. Reject it rather than storing an assistant blob.
         if title is not None and len(title.split()) > _MAX_TITLE_WORDS:
             logger.debug(
                 "Rejecting answer-shaped title output (%d words > %d)",
