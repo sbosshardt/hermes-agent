@@ -264,6 +264,7 @@ class TestConfig:
         assert provider._retain_every_n_turns == 1
         assert provider._recall_max_tokens == 4096
         assert provider._recall_max_input_chars == 800
+        assert provider._prefetch_join_timeout == 3.0
         assert provider._tags is None
         assert provider._observation_scopes is None
         assert provider._recall_tags is None
@@ -302,6 +303,7 @@ class TestConfig:
             recall_types=["world", "experience"],
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
+            prefetch_join_timeout=7.5,
             bank_mission="Test agent mission",
         )
         assert p._tags == ["tag1", "tag2"]
@@ -320,6 +322,7 @@ class TestConfig:
         assert p._recall_types == ["world", "experience"]
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
+        assert p._prefetch_join_timeout == 7.5
         assert p._bank_mission == "Test agent mission"
 
     def test_retain_source_defaults_empty(self, provider):
@@ -336,6 +339,24 @@ class TestConfig:
         p = provider_with_config(retain_source="cogoport")
         assert p._retain_source == "cogoport"
         assert p._build_metadata(message_count=2, turn_index=1)["source"] == "cogoport"
+
+    def test_prefetch_join_timeout_from_env(self, provider, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_PREFETCH_JOIN_TIMEOUT", "6.5")
+        monkeypatch.setattr("plugins.memory.hindsight._load_config", lambda: {})
+
+        provider.initialize("env-prefetch-session")
+
+        assert provider._prefetch_join_timeout == 6.5
+
+    def test_wait_for_prefetch_uses_configured_timeout(self, provider):
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        provider._prefetch_thread = thread
+        provider._prefetch_join_timeout = 4.25
+
+        provider._wait_for_prefetch_thread()
+
+        thread.join.assert_called_once_with(timeout=4.25)
 
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({

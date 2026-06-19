@@ -6,6 +6,8 @@ retrieval. Supports cloud (API key) and local modes.
 Configurable request timeout via HINDSIGHT_TIMEOUT env var or config.json.
 Configurable embedded daemon idle timeout via HINDSIGHT_IDLE_TIMEOUT env var
 or config.json idle_timeout.
+Configurable prefetch join timeout via HINDSIGHT_PREFETCH_JOIN_TIMEOUT env var
+or config.json prefetch_join_timeout.
 
 Original PR #1811 by benfrank241, adapted to MemoryProvider ABC.
 
@@ -17,6 +19,7 @@ Config via environment variables:
   HINDSIGHT_MODE                   — cloud or local (default: cloud)
   HINDSIGHT_TIMEOUT                — API request timeout in seconds (default: 120)
   HINDSIGHT_IDLE_TIMEOUT           — embedded daemon idle timeout seconds; 0 disables shutdown (default: 300)
+  HINDSIGHT_PREFETCH_JOIN_TIMEOUT  — best-effort wait for background prefetch completion (default: 3.0)
   HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT — seconds to wait for a slow embedded daemon /health before treating it as stale (default: 30; set via config.json port_health_grace_timeout)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
   HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
@@ -85,6 +88,9 @@ _DEFAULT_RETAIN_SOURCE = ""
 # Hindsight brand mark — the logo is an eye ringed by graph nodes. Used for
 # the deterministic recall/retain indicators (overrides the generic core default).
 _HINDSIGHT_GLYPH = "👁️"
+# Best-effort wait for background prefetches. A configurable window avoids
+# discarding recall merely because a busy provider needs slightly longer.
+_PREFETCH_JOIN_TIMEOUT = 3.0
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -124,6 +130,17 @@ def _parse_int_setting(value: Any, default: int) -> int:
 # surface it as plugin config so users can raise it without hand-setting an
 # env var, consistent with "config.json, not raw env vars".
 _PORT_HEALTH_GRACE_ENV = "HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT"
+
+
+def _parse_float_setting(value: Any, default: float) -> float:
+    """Parse a float config/env value, falling back on invalid input."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid float Hindsight setting %r; using default %s", value, default)
+        return default
 
 
 def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
@@ -874,6 +891,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # send only the new delta on subsequent retains when the API supports
         # update_mode='append' (legacy/overwrite path still sends everything).
         self._last_retained_turn_count = 0
+        self._prefetch_join_timeout = _PREFETCH_JOIN_TIMEOUT
 
         # Recall controls
         self._auto_recall = True
@@ -1236,6 +1254,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "prefetch_join_timeout", "description": "Best-effort wait in seconds for background prefetch completion before using a turn", "default": _PREFETCH_JOIN_TIMEOUT},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1756,6 +1775,11 @@ class HindsightMemoryProvider(MemoryProvider):
         # when a turn is dispatched to the writer. Same off switch rationale.
         self._retain_indicator = bool(self._config.get("retain_indicator", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        self._prefetch_join_timeout = _parse_float_setting(
+            self._config.get("prefetch_join_timeout")
+            or os.environ.get("HINDSIGHT_PREFETCH_JOIN_TIMEOUT"),
+            _PREFETCH_JOIN_TIMEOUT,
+        )
         self._retain_async = self._config.get("retain_async", True)
         self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(
@@ -1872,6 +1896,14 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
+    def _wait_for_prefetch_thread(self, timeout: float | None = None) -> None:
+        """Best-effort wait for the background prefetch thread to settle."""
+        if timeout is None:
+            timeout = getattr(self, "_prefetch_join_timeout", _PREFETCH_JOIN_TIMEOUT)
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            logger.debug("Prefetch: waiting for background thread to complete")
+            self._prefetch_thread.join(timeout=timeout)
+
     def _recall_disabled(self) -> bool:
         """Guards shared by the async and synchronous recall paths."""
         if self._memory_mode == "tools":
@@ -1957,10 +1989,8 @@ class HindsightMemoryProvider(MemoryProvider):
             return self._format_recall(recalled.text)
 
         # Default: return the result the background worker prefetched for the
-        # previous turn (cheap buffer read, capped join).
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            logger.debug("Prefetch: waiting for background thread to complete")
-            self._prefetch_thread.join(timeout=3.0)
+        # previous turn (cheap buffer read, capped configurable join).
+        self._wait_for_prefetch_thread()
         with self._prefetch_lock:
             result = self._prefetch_result
             count = self._prefetch_count
@@ -2396,8 +2426,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # 2. Drain any in-flight prefetch from the old session and drop
         # its cached result so the new session doesn't see stale recall.
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
+        self._wait_for_prefetch_thread()
         with self._prefetch_lock:
             self._prefetch_result = ""
 
