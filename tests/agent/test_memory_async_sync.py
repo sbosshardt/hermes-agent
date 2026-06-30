@@ -66,6 +66,22 @@ class _SlowProvider(MemoryProvider):
         return ""
 
 
+def test_sync_all_does_not_block_on_slow_provider():
+    """The crux of the fix: a slow provider must NOT stall the caller.
+
+    sync_all() dispatches through the sync executor; queue_prefetch_all()
+    dispatches through a separate prefetch executor. Both return immediately.
+    """
+    mgr = MemoryManager()
+    mgr.add_provider(_SlowProvider(delay=2.0))
+
+    t0 = time.time()
+    mgr.sync_all("hi", "hey", session_id="s1")
+    mgr.queue_prefetch_all("hi", session_id="s1")
+    elapsed = time.time() - t0
+
+    # Both dispatch off-thread; must return ~instantly.
+    assert elapsed < 0.5, f"turn-completion path blocked {elapsed:.2f}s"
 
 
 def test_background_work_still_completes():
@@ -80,6 +96,66 @@ def test_background_work_still_completes():
     assert mgr.flush_pending(timeout=10) is True
     assert p.sync_done is True
     assert p.prefetch_done is True
+
+
+def test_prefetch_executor_starts_while_sync_executor_is_blocked():
+    """A slow durable sync must not starve next-turn prefetch dispatch."""
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+    prefetch_started = threading.Event()
+
+    class _BlockingProvider(_SlowProvider):
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            sync_started.set()
+            assert release_sync.wait(timeout=2)
+
+        def queue_prefetch(self, query, *, session_id=""):
+            prefetch_started.set()
+
+    mgr = MemoryManager()
+    mgr.add_provider(_BlockingProvider(delay=0))
+    mgr.sync_all("hi", "hey", session_id="s1")
+    assert sync_started.wait(timeout=1)
+
+    mgr.queue_prefetch_all("next turn", session_id="s1")
+
+    assert prefetch_started.wait(timeout=1)
+    release_sync.set()
+    assert mgr.flush_pending(timeout=2) is True
+
+
+def test_shutdown_timeout_reports_abandoned_queued_prefetch(monkeypatch, caplog):
+    """Shutdown reports queued prefetch loss from the separate executor."""
+    import agent.memory_manager as memory_manager_module
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class _WedgedPrefetchProvider(_SlowProvider):
+        def queue_prefetch(self, query, *, session_id=""):
+            if query == "active":
+                started.set()
+                release.wait(timeout=2)
+            calls.append(query)
+
+    monkeypatch.setattr(memory_manager_module, "_SYNC_DRAIN_TIMEOUT_S", 0.1)
+    mgr = MemoryManager()
+    mgr.add_provider(_WedgedPrefetchProvider(delay=0))
+    mgr.queue_prefetch_all("active")
+    assert started.wait(timeout=1)
+    mgr.queue_prefetch_all("queued")
+
+    with caplog.at_level(logging.WARNING, logger="agent.memory_manager"):
+        mgr.shutdown_all()
+
+    state = mgr.shutdown_drain_state
+    assert state["status"] == "timed_out"
+    assert state["abandoned_prefetches"] == 1
+    assert state["active_tasks"] == 1
+    assert "queued" not in calls
+    assert "1 queued prefetch" in caplog.text
+    release.set()
 
 
 
