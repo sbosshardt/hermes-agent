@@ -1855,6 +1855,7 @@ def init_agent(
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_store = None
     agent._memory_enabled = False
+    agent._memory_sync_recall = False
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
@@ -1882,6 +1883,7 @@ def init_agent(
             agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
                 _agent_cfg
             )
+            agent._memory_sync_recall = bool(mem_config.get("sync_recall", False))
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore

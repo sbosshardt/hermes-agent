@@ -4562,7 +4562,10 @@ class AIAgent:
             # next turn's recall with a trivial prompt ("hi", "thanks") keys
             # provider searches on zero-signal text — skip it. The sync above
             # still runs so the turn itself is persisted.
-            if not is_trivial_prompt(user_text):
+            if (
+                not is_trivial_prompt(user_text)
+                and not getattr(self, "_memory_sync_recall", False)
+            ):
                 self._memory_manager.queue_prefetch_all(
                     user_text,
                     session_id=self.session_id or "",

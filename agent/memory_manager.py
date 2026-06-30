@@ -698,6 +698,27 @@ class MemoryManager:
                 detail = "recalled relevant memory"
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
+    def recall_sync_all(self, query: str, *, session_id: str = "") -> str:
+        """Synchronously recall context from all providers using the current query.
+
+        Use in place of prefetch_all() when memory.sync_recall is enabled.
+        Slower but always returns context relevant to the current message.
+        """
+        clean_query = self._strip_skill_scaffolding(query)
+        if not clean_query:
+            return ""
+        parts = []
+        for provider in self._providers:
+            try:
+                result = provider.recall_sync(clean_query, session_id=session_id)
+                if result and result.strip():
+                    parts.append(result)
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' recall_sync failed (non-fatal): %s",
+                    provider.name, e,
+                )
+        return "\n\n".join(parts)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.
