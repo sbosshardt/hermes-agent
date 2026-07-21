@@ -23,6 +23,7 @@ from plugins.memory.hindsight import (
     RETAIN_SCHEMA,
     _load_config,
     _build_embedded_profile_env,
+    _check_local_runtime,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
@@ -141,6 +142,24 @@ def _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, mod
         "timeout": 120.0,
         "api_key": "test-key",
     }
+
+
+def test_local_runtime_check_uses_hindsight_embed_imports(monkeypatch):
+    calls = []
+
+    def fake_import(name):
+        calls.append(name)
+        if name in {"hindsight_embed", "hindsight_embed.daemon_embed_manager"}:
+            return object()
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr("plugins.memory.hindsight.importlib.import_module", fake_import)
+
+    ok, error = _check_local_runtime()
+
+    assert ok is True
+    assert error is None
+    assert calls == ["hindsight_embed", "hindsight_embed.daemon_embed_manager"]
 
 
 class _FakeSessionDB:
