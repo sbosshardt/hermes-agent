@@ -687,6 +687,8 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    ext_prefetch_cache: str = "",
+    plugin_user_context: str = "",
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -772,8 +774,21 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # The app-server path bypasses chat-completions' api_messages builder.
+    # Compose the same API-only memory/plugin context here without mutating the
+    # clean persisted user message.
+    from agent.turn_context import compose_user_api_content, _mark_auto_recall_append
+
+    codex_user_input = compose_user_api_content(
+        user_message,
+        ext_prefetch_cache,
+        plugin_user_context,
+    ) or user_message
+    if ext_prefetch_cache:
+        _mark_auto_recall_append(agent, codex_user_input)
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(user_input=codex_user_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

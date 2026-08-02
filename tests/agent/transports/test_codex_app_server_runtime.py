@@ -89,6 +89,72 @@ class TestMaybeApplyCodexAppServerRuntime:
         )
 
 
+class TestCodexAppServerMemoryInjection:
+    """The early-return runtime must preserve API-only memory context."""
+
+    def test_run_turn_receives_memory_and_plugin_context_without_persisting_it(
+        self, monkeypatch
+    ) -> None:
+        from agent import codex_runtime
+        from agent.codex_runtime import run_codex_app_server_turn
+        from agent.transports.codex_app_server_session import TurnResult
+
+        captured: dict[str, str] = {}
+
+        class FakeCodexSession:
+            def run_turn(self, user_input):
+                captured["user_input"] = user_input
+                return TurnResult(
+                    final_text="done",
+                    projected_messages=[{"role": "assistant", "content": "done"}],
+                    thread_id="thread-1",
+                    turn_id="turn-1",
+                )
+
+        class FakeAgent:
+            _codex_session = FakeCodexSession()
+            _iters_since_skill = 0
+            _skill_nudge_interval = 0
+            valid_tool_names = set()
+            _session_db = None
+            session_id = "session-1"
+            session_api_calls = 0
+            _last_auto_recall_observation = {
+                "mode": "sync_recall",
+                "attempted": True,
+            }
+
+            def _sync_external_memory_for_turn(self, **kwargs):
+                pass
+
+            def _spawn_background_review(self, **kwargs):
+                raise AssertionError("background review should not run in this test")
+
+        monkeypatch.setattr(
+            codex_runtime, "_record_codex_app_server_usage", lambda agent, turn: {}
+        )
+
+        messages = [{"role": "user", "content": "Hello"}]
+        agent = FakeAgent()
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="Hello",
+            original_user_message="Hello",
+            messages=messages,
+            effective_task_id="task-1",
+            ext_prefetch_cache="Samuel prefers concise telemetry-backed ops answers.",
+            plugin_user_context="plugin note",
+        )
+
+        assert result["completed"] is True
+        assert captured["user_input"].startswith("Hello")
+        assert "<memory-context>" in captured["user_input"]
+        assert "Samuel prefers concise telemetry-backed ops answers" in captured["user_input"]
+        assert captured["user_input"].endswith("plugin note")
+        assert messages[0] == {"role": "user", "content": "Hello"}
+        assert agent._last_auto_recall_observation["memory_context_appended"] is True
+
+
 class TestCodexAppServerModule:
     """Module-surface tests for the JSON-RPC speaker. Don't require codex CLI."""
 
