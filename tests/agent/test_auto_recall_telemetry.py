@@ -5,7 +5,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent.turn_context import _collect_external_memory_context, _mark_auto_recall_append
+from agent.turn_context import (
+    _collect_external_memory_context,
+    _mark_auto_recall_append,
+    compose_user_api_content,
+)
 
 
 def _agent(*, result="remembered fact", error=None):
@@ -99,3 +103,7 @@ def test_append_observation_records_missing_block():
     assert observation["append_logged"] is True
     assert observation["memory_context_appended"] is False
     assert observation["append_failure_reason"] == "build_block_empty"
+
+
+def test_api_content_composer_ignores_non_string_optional_context():
+    assert compose_user_api_content("hello", MagicMock(), MagicMock()) is None

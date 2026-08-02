@@ -151,6 +151,18 @@ def compose_user_api_content(
     """
     if not isinstance(content, str):
         return None
+
+    # Provider contracts return strings, but defensive normalization keeps a
+    # partially mocked/disabled provider from breaking alternate transports.
+    # The standard chat-completions and Codex app-server paths share this
+    # composer, so malformed optional context must degrade to no injection.
+    ext_prefetch_cache = (
+        ext_prefetch_cache if isinstance(ext_prefetch_cache, str) else ""
+    )
+    plugin_user_context = (
+        plugin_user_context if isinstance(plugin_user_context, str) else ""
+    )
+
     injections = []
     if ext_prefetch_cache:
         fenced = build_memory_context_block(ext_prefetch_cache)
