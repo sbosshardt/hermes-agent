@@ -472,6 +472,19 @@ class TestSessionLifecycle:
         assert row["billing_base_url"] is None
         assert row["billing_mode"] is None
 
+    def test_update_auto_recall_metrics(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.update_auto_recall_metrics("s1", attempts=1, failures=0, latency_ms=48000)
+        db.update_auto_recall_metrics("s1", attempts=1, failures=1, latency_ms=12000)
+
+        session = db.get_session("s1")
+        assert session["auto_recall_attempt_count"] == 2
+        assert session["auto_recall_success_count"] == 1
+        assert session["auto_recall_failure_count"] == 1
+        assert session["auto_recall_total_latency_ms"] == 60000
+        assert session["auto_recall_min_latency_ms"] == 12000
+        assert session["auto_recall_max_latency_ms"] == 48000
+
 
 
 

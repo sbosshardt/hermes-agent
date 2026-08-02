@@ -41,6 +41,8 @@ def populated_db(db):
     db.end_session("s1", end_reason="user_exit")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's1'", (now - 2 * day + 3600,))
     db.update_token_counts("s1", input_tokens=50000, output_tokens=15000)
+    db.update_auto_recall_metrics("s1", attempts=1, failures=0, latency_ms=48000)
+    db.update_auto_recall_metrics("s1", attempts=1, failures=1, latency_ms=60000)
     db.append_message("s1", role="user", content="Hello, help me fix a bug")
     db.append_message("s1", role="assistant", content="Sure, let me look into that.")
     db.append_message("s1", role="assistant", content="Let me search the files.",
@@ -70,6 +72,7 @@ def populated_db(db):
     db.end_session("s2", end_reason="timeout")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's2'", (now - 5 * day + 1800,))
     db.update_token_counts("s2", input_tokens=20000, output_tokens=8000)
+    db.update_auto_recall_metrics("s2", attempts=1, failures=0, latency_ms=12000)
     db.append_message("s2", role="user", content="Search the web for something")
     db.append_message("s2", role="assistant", content="Searching...",
                       tool_calls=[{"function": {"name": "web_search"}}])
@@ -247,6 +250,29 @@ class TestInsightsEmpty:
 # =========================================================================
 
 class TestInsightsPopulated:
+
+    def test_memory_recall_summary(self, populated_db):
+        report = InsightsEngine(populated_db).generate(days=30)
+        recall = report["memory_recall"]
+
+        assert recall["attempts"] == 3
+        assert recall["successes"] == 2
+        assert recall["failures"] == 1
+        assert recall["failure_percentage"] == pytest.approx(33.333, abs=0.01)
+        assert recall["min_latency_ms"] == 12000
+        assert recall["avg_latency_ms"] == pytest.approx(40000.0, abs=0.01)
+        assert recall["max_latency_ms"] == 60000
+
+    def test_memory_recall_respects_days_filter(self, populated_db):
+        recall = InsightsEngine(populated_db).generate(days=3)["memory_recall"]
+
+        assert recall["attempts"] == 2
+        assert recall["successes"] == 1
+        assert recall["failures"] == 1
+        assert recall["failure_percentage"] == pytest.approx(50.0, abs=0.01)
+        assert recall["min_latency_ms"] == 48000
+        assert recall["avg_latency_ms"] == pytest.approx(54000.0, abs=0.01)
+        assert recall["max_latency_ms"] == 60000
 
 
     def test_overview_token_totals(self, populated_db):
@@ -539,6 +565,7 @@ class TestTerminalFormatting:
         assert "Models Used" in text
         assert "Top Tools" in text
         assert "Top Skills" in text
+        assert "Auto-Injected Recall" in text
         assert "Activity Patterns" in text
         assert "Notable Sessions" in text
 
@@ -572,6 +599,13 @@ class TestGatewayFormatting:
         gateway_text = engine.format_gateway(report)
 
         assert len(gateway_text) < len(terminal_text)
+
+    def test_gateway_format_shows_auto_recall(self, populated_db):
+        report = InsightsEngine(populated_db).generate(days=30)
+        text = InsightsEngine(populated_db).format_gateway(report)
+
+        assert "Auto-injected recall" in text
+        assert "3 attempts" in text
 
 
     def test_gateway_format_hides_cache_details(self, populated_db):

@@ -183,6 +183,16 @@ class InsightsEngine:
                 },
                 "activity": {},
                 "top_sessions": [],
+                "memory_recall": {
+                    "attempts": 0,
+                    "successes": 0,
+                    "failures": 0,
+                    "failure_percentage": 0.0,
+                    "total_latency_ms": 0,
+                    "min_latency_ms": 0,
+                    "avg_latency_ms": 0.0,
+                    "max_latency_ms": 0,
+                },
             }
 
         # Compute insights
@@ -193,6 +203,7 @@ class InsightsEngine:
         skills = self._compute_skill_breakdown(skill_usage)
         activity = self._compute_activity_patterns(sessions)
         top_sessions = self._compute_top_sessions(sessions)
+        memory_recall = self._compute_memory_recall_metrics(sessions)
 
         return {
             "days": days,
@@ -206,6 +217,7 @@ class InsightsEngine:
             "skills": skills,
             "activity": activity,
             "top_sessions": top_sessions,
+            "memory_recall": memory_recall,
         }
 
     def get_usage_breakdown(self, days: int = 30, source: str = None) -> Dict[str, Any]:
@@ -232,7 +244,10 @@ class InsightsEngine:
                      "message_count, tool_call_count, input_tokens, output_tokens, "
                      "cache_read_tokens, cache_write_tokens, billing_provider, "
                      "billing_base_url, billing_mode, estimated_cost_usd, "
-                     "actual_cost_usd, cost_status, cost_source, api_call_count")
+                     "actual_cost_usd, cost_status, cost_source, api_call_count, "
+                     "auto_recall_attempt_count, auto_recall_success_count, "
+                     "auto_recall_failure_count, auto_recall_total_latency_ms, "
+                     "auto_recall_min_latency_ms, auto_recall_max_latency_ms")
 
     # Pre-computed query strings — f-string evaluated once at class definition,
     # not at runtime, so no user-controlled value can alter the query structure.
@@ -963,6 +978,34 @@ class InsightsEngine:
 
         return top
 
+    @staticmethod
+    def _compute_memory_recall_metrics(sessions: List[Dict]) -> Dict[str, Any]:
+        """Aggregate persisted auto-injected recall telemetry."""
+        attempts = sum(int(s.get("auto_recall_attempt_count") or 0) for s in sessions)
+        successes = sum(int(s.get("auto_recall_success_count") or 0) for s in sessions)
+        failures = sum(int(s.get("auto_recall_failure_count") or 0) for s in sessions)
+        total_latency_ms = sum(
+            int(s.get("auto_recall_total_latency_ms") or 0) for s in sessions
+        )
+        minimums = [
+            int(s["auto_recall_min_latency_ms"])
+            for s in sessions
+            if s.get("auto_recall_min_latency_ms") is not None
+        ]
+        maximums = [
+            int(s.get("auto_recall_max_latency_ms") or 0) for s in sessions
+        ]
+        return {
+            "attempts": attempts,
+            "successes": successes,
+            "failures": failures,
+            "failure_percentage": (failures / attempts * 100.0) if attempts else 0.0,
+            "total_latency_ms": total_latency_ms,
+            "min_latency_ms": min(minimums) if minimums else 0,
+            "avg_latency_ms": (total_latency_ms / attempts) if attempts else 0.0,
+            "max_latency_ms": max(maximums) if maximums else 0,
+        }
+
     # =========================================================================
     # Formatting
     # =========================================================================
@@ -1033,7 +1076,26 @@ class InsightsEngine:
                     f"  Unknown:            {unknown_sessions} session(s) "
                     f"(no pricing data)"
                 )
-            lines.append("")
+
+        recall = report.get("memory_recall", {})
+        if recall.get("attempts", 0):
+            lines.append("  🧠 Auto-Injected Recall")
+            lines.append("  " + "─" * 56)
+            lines.append(
+                f"  Attempts:          {recall['attempts']:<12,}  "
+                f"Successes:       {recall['successes']:,}"
+            )
+            lines.append(
+                f"  Failures:          {recall['failures']:<12,}  "
+                f"Failure rate:    {recall['failure_percentage']:.1f}%"
+            )
+            lines.append(
+                "  Latency min/avg/max: "
+                f"{format_duration_compact(recall['min_latency_ms'] / 1000)} / "
+                f"{format_duration_compact(recall['avg_latency_ms'] / 1000)} / "
+                f"{format_duration_compact(recall['max_latency_ms'] / 1000)}"
+            )
+        lines.append("")
 
         # Model breakdown
         if report["models"]:
@@ -1145,6 +1207,15 @@ class InsightsEngine:
         # Overview
         lines.append(f"**Sessions:** {o['total_sessions']} | **Messages:** {o['total_messages']:,} | **Tool calls:** {o['total_tool_calls']:,}")
         lines.append(f"**Tokens:** {o['total_tokens']:,} (in: {o['total_input_tokens']:,} / out: {o['total_output_tokens']:,})")
+
+        recall = report.get("memory_recall", {})
+        if recall.get("attempts", 0):
+            lines.append(
+                "**Auto-injected recall:** "
+                f"{recall['attempts']} attempts, {recall['successes']} succeeded "
+                f"({recall['failures']} failures, {recall['failure_percentage']:.1f}%); "
+                f"avg {format_duration_compact(recall['avg_latency_ms'] / 1000)}"
+            )
         if o["total_hours"] > 0:
             lines.append(f"**Active time:** ~{format_duration_compact(o['total_hours'] * 3600)} | **Avg session:** ~{format_duration_compact(o['avg_session_duration'])}")
         lines.append("")

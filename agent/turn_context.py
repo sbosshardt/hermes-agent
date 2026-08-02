@@ -163,6 +163,107 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
+def _collect_external_memory_context(agent: Any, query: str) -> str:
+    """Collect per-turn memory context and record sync-recall observability."""
+    agent._last_auto_recall_observation = None
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is None or is_trivial_prompt(query):
+        return ""
+
+    if not getattr(agent, "_memory_sync_recall", False):
+        try:
+            return manager.prefetch_all(query) or ""
+        except Exception:
+            return ""
+
+    started = time.monotonic()
+    recall_error = None
+    try:
+        context = manager.recall_sync_all(
+            query,
+            session_id=getattr(agent, "session_id", None) or "",
+        ) or ""
+    except Exception as exc:
+        recall_error = exc
+        context = ""
+
+    latency_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
+    success = bool(context.strip()) and recall_error is None
+    if recall_error is not None:
+        failure_reason = type(recall_error).__name__
+    elif not success:
+        failure_reason = "empty_result"
+    else:
+        failure_reason = ""
+
+    observation = {
+        "mode": "sync_recall",
+        "attempted": True,
+        "success": success,
+        "latency_ms": latency_ms,
+        "context_chars": len(context),
+        "failure_reason": failure_reason,
+    }
+    agent._last_auto_recall_observation = observation
+
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is not None and session_id:
+        try:
+            if not getattr(agent, "_session_db_created", False):
+                ensure_session = getattr(agent, "_ensure_db_session", None)
+                if callable(ensure_session):
+                    ensure_session()
+            session_db.update_auto_recall_metrics(
+                session_id,
+                attempts=1,
+                failures=0 if success else 1,
+                latency_ms=latency_ms,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Auto-recall metrics persistence failed (session=%s): %s",
+                session_id,
+                exc,
+            )
+
+    logger.info(
+        "Auto-recall sync_recall: session=%s success=%s latency_ms=%d "
+        "context_chars=%d failure_reason=%s",
+        session_id or "",
+        success,
+        latency_ms,
+        len(context),
+        failure_reason or "none",
+    )
+    return context
+
+
+def _mark_auto_recall_append(agent: Any, sent_content: Any) -> None:
+    """Record once whether recalled context reached the provider-bound text."""
+    observation = getattr(agent, "_last_auto_recall_observation", None)
+    if not isinstance(observation, dict) or observation.get("append_logged"):
+        return
+
+    appended = isinstance(sent_content, str) and "<memory-context>" in sent_content
+    observation["append_logged"] = True
+    observation["memory_context_appended"] = appended
+    if appended:
+        observation["memory_context_chars"] = len(sent_content)
+        logger.info(
+            "Auto-recall memory-context appended: session=%s chars=%d",
+            getattr(agent, "session_id", None) or "",
+            len(sent_content),
+        )
+    else:
+        observation["append_failure_reason"] = "build_block_empty"
+        logger.info(
+            "Auto-recall memory-context append skipped: session=%s "
+            "reason=build_block_empty",
+            getattr(agent, "session_id", None) or "",
+        )
+
+
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     """Pop the ``api_content`` sidecar and substitute it into ``content``.
 
@@ -1484,29 +1585,19 @@ def build_turn_context(
         except Exception:
             pass
 
-    # External memory provider: prefetch once before the tool loop.
-    #
-    # Skip prefetch on trivial prompts (greetings, acknowledgements) to
-    # prevent memory-context injection on turns that carry no semantic signal.
-    ext_prefetch_cache = ""
-    if agent._memory_manager:
+    # External memory provider: collect once before the tool loop. The helper
+    # preserves the trivial-prompt gate and records sync-recall telemetry.
+    _query = original_user_message if isinstance(original_user_message, str) else ""
+    ext_prefetch_cache = _collect_external_memory_context(agent, _query)
+    # Deterministic, model-independent recall indicator: when memory was
+    # injected this turn, surface it independently of model wording.
+    if ext_prefetch_cache:
         try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
-            if not is_trivial_prompt(_query):
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            _recall_indicator = agent._memory_manager.describe_recall()
+            if _recall_indicator:
+                agent._emit_status(_recall_indicator)
         except Exception:
             pass
-        # Deterministic, model-independent recall indicator: when memory was
-        # actually injected this turn, tell the user — don't rely on the model
-        # to surface it. Rendered by Hermes (via _emit_status), so it always
-        # shows and can't be silently dropped by the model.
-        if ext_prefetch_cache:
-            try:
-                _recall_indicator = agent._memory_manager.describe_recall()
-                if _recall_indicator:
-                    agent._emit_status(_recall_indicator)
-            except Exception:
-                pass
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this

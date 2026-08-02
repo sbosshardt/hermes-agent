@@ -43,6 +43,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
+    _mark_auto_recall_append,
     _review_fork_first_request_pending,
     build_turn_context,
     compose_user_api_content,
@@ -2386,6 +2387,8 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                if _ext_prefetch_cache:
+                    _mark_auto_recall_append(agent, api_msg.get("content"))
             elif (
                 isinstance(_api_content, str)
                 and _api_content

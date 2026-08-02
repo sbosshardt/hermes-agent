@@ -9602,6 +9602,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ),
         )
 
+    def update_auto_recall_metrics(
+        self,
+        session_id: str,
+        *,
+        attempts: int = 1,
+        failures: int = 0,
+        latency_ms: Optional[int] = None,
+    ) -> None:
+        """Persist auto-injected recall attempt/failure/latency telemetry."""
+        attempts = max(int(attempts or 0), 0)
+        failures = max(int(failures or 0), 0)
+        successes = max(attempts - failures, 0)
+        latency_ms = None if latency_ms is None else max(int(latency_ms), 0)
+
+        self._insert_session_row(session_id, "unknown")
+        sql = """UPDATE sessions SET
+               auto_recall_attempt_count = COALESCE(auto_recall_attempt_count, 0) + ?,
+               auto_recall_success_count = COALESCE(auto_recall_success_count, 0) + ?,
+               auto_recall_failure_count = COALESCE(auto_recall_failure_count, 0) + ?,
+               auto_recall_total_latency_ms = COALESCE(auto_recall_total_latency_ms, 0) + COALESCE(?, 0),
+               auto_recall_min_latency_ms = CASE
+                   WHEN ? IS NULL THEN auto_recall_min_latency_ms
+                   WHEN auto_recall_min_latency_ms IS NULL THEN ?
+                   ELSE MIN(auto_recall_min_latency_ms, ?)
+               END,
+               auto_recall_max_latency_ms = CASE
+                   WHEN ? IS NULL THEN COALESCE(auto_recall_max_latency_ms, 0)
+                   ELSE MAX(COALESCE(auto_recall_max_latency_ms, 0), ?)
+               END
+               WHERE id = ?"""
+        params = (
+            attempts,
+            successes,
+            failures,
+            latency_ms,
+            latency_ms,
+            latency_ms,
+            latency_ms,
+            latency_ms,
+            latency_ms,
+            session_id,
+        )
+
+        def _do(conn):
+            conn.execute(sql, params)
+
+        self._execute_write(_do)
+
     def ensure_session(
         self,
         session_id: str,
