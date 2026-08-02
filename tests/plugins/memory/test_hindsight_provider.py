@@ -28,6 +28,7 @@ from plugins.memory.hindsight import (
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
+    _check_local_runtime,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
@@ -1388,6 +1389,61 @@ class TestBankIdTemplate:
 
 
 class TestAvailability:
+    def test_embedded_runtime_accepts_uvx_isolated_api(self, monkeypatch):
+        class FakeManager:
+            def _find_api_command(self, api_version):
+                assert api_version == "0.8.4"
+                return ["uvx", f"hindsight-api@{api_version}"]
+
+        fake_module = SimpleNamespace(DaemonEmbedManager=FakeManager)
+        imported = []
+
+        def fake_import(name):
+            imported.append(name)
+            if name == "hindsight_embed.daemon_embed_manager":
+                return fake_module
+            raise AssertionError(f"unexpected host-runtime import: {name}")
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.importlib.import_module", fake_import
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.importlib_metadata.version",
+            lambda name: "0.8.4",
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.shutil.which",
+            lambda name: "/usr/bin/uvx" if name == "uvx" else None,
+        )
+
+        available, error = _check_local_runtime()
+
+        assert available is True
+        assert error is None
+        assert imported == ["hindsight_embed.daemon_embed_manager"]
+
+    def test_embedded_runtime_rejects_missing_launcher(self, monkeypatch):
+        class FakeManager:
+            def _find_api_command(self, api_version):
+                return ["uvx", f"hindsight-api@{api_version}"]
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.importlib.import_module",
+            lambda name: SimpleNamespace(DaemonEmbedManager=FakeManager),
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.importlib_metadata.version",
+            lambda name: "0.8.4",
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.shutil.which", lambda name: None
+        )
+
+        available, error = _check_local_runtime()
+
+        assert available is False
+        assert "launcher" in error.lower()
+
     def test_available_with_api_key(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "plugins.memory.hindsight.get_hermes_home",

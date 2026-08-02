@@ -33,10 +33,12 @@ from __future__ import annotations
 import asyncio
 import atexit
 import importlib
+from importlib import metadata as importlib_metadata
 import json
 import logging
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -152,25 +154,31 @@ def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
 
 
 def _check_local_runtime() -> tuple[bool, str | None]:
-    """Return whether local embedded Hindsight imports cleanly.
+    """Return whether the embedded Hindsight wrapper can launch its API.
 
-    On older CPUs, importing the local Hindsight stack can raise a runtime
-    error from NumPy before the daemon starts. Treat that as "unavailable"
-    so Hermes can degrade gracefully instead of repeatedly trying to start
-    a broken local memory backend.
+    ``hindsight-embed`` 0.8.x deliberately keeps the heavyweight API,
+    transformers, and embedding stack out of the host Hermes environment. Its
+    daemon manager launches the matching ``hindsight-api`` through ``uvx`` (or
+    an already-installed local entry point), so importing ``hindsight`` and
+    ``sentence_transformers`` in the host venv is a false-negative probe.
 
-    The embedded daemon computes embeddings via ``sentence_transformers``
-    (transformers + huggingface-hub). Importing ``hindsight`` /
-    ``hindsight_embed`` alone succeeds even when that stack is broken, so
-    without importing it here the probe would falsely report the backend
-    healthy and ``hermes memory status`` would stay green while the daemon
-    aborts at startup on every retain/recall. Import it too so the probe (and
-    status) reports the real ImportError.
+    Ask the wrapper which launcher it would use, then verify that executable is
+    reachable without starting a daemon. Import errors from the lightweight
+    wrapper still degrade local memory cleanly.
     """
     try:
-        importlib.import_module("hindsight")
-        importlib.import_module("hindsight_embed.daemon_embed_manager")
-        importlib.import_module("sentence_transformers")
+        from pathlib import Path
+
+        manager_module = importlib.import_module(
+            "hindsight_embed.daemon_embed_manager"
+        )
+        api_version = importlib_metadata.version("hindsight-embed")
+        command = manager_module.DaemonEmbedManager()._find_api_command(api_version)
+        if not command:
+            return False, "Hindsight embedded API launcher was not resolved"
+        launcher = str(command[0])
+        if not Path(launcher).is_file() and shutil.which(launcher) is None:
+            return False, f"Hindsight embedded API launcher is unavailable: {launcher}"
         return True, None
     except Exception as exc:
         return False, str(exc)
