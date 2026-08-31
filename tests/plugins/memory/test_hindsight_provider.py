@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+import plugins.memory.hindsight as hindsight_module
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -1404,15 +1405,13 @@ class TestAvailability:
                 return fake_module
             raise AssertionError(f"unexpected host-runtime import: {name}")
 
+        monkeypatch.setattr(hindsight_module.importlib, "import_module", fake_import)
         monkeypatch.setattr(
-            "plugins.memory.hindsight.importlib.import_module", fake_import
+            hindsight_module.importlib_metadata, "version", lambda name: "0.8.4"
         )
         monkeypatch.setattr(
-            "plugins.memory.hindsight.importlib_metadata.version",
-            lambda name: "0.8.4",
-        )
-        monkeypatch.setattr(
-            "plugins.memory.hindsight.shutil.which",
+            hindsight_module.shutil,
+            "which",
             lambda name: "/usr/bin/uvx" if name == "uvx" else None,
         )
 
@@ -1428,16 +1427,14 @@ class TestAvailability:
                 return ["uvx", f"hindsight-api@{api_version}"]
 
         monkeypatch.setattr(
-            "plugins.memory.hindsight.importlib.import_module",
+            hindsight_module.importlib,
+            "import_module",
             lambda name: SimpleNamespace(DaemonEmbedManager=FakeManager),
         )
         monkeypatch.setattr(
-            "plugins.memory.hindsight.importlib_metadata.version",
-            lambda name: "0.8.4",
+            hindsight_module.importlib_metadata, "version", lambda name: "0.8.4"
         )
-        monkeypatch.setattr(
-            "plugins.memory.hindsight.shutil.which", lambda name: None
-        )
+        monkeypatch.setattr(hindsight_module.shutil, "which", lambda name: None)
 
         available, error = _check_local_runtime()
 
