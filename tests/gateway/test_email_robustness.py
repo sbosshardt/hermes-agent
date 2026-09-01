@@ -51,6 +51,10 @@ class TestImapResponseGuard(unittest.TestCase):
                 return ("OK", [uids])
             if command == "fetch":
                 return next(fetch_iter)
+            if command == "store":
+                # The adapter acknowledges a successfully parsed message before
+                # returning it for dispatch; model that durable IMAP success.
+                return ("OK", [])
             return ("NO", [])
 
         mock_imap = MagicMock()
