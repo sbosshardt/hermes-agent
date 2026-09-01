@@ -5,7 +5,7 @@
 - **Release candidate:** `v2026.8.31` / Hermes Agent `v0.21.0`
 - **Maintained branch:** `execreations`
 - **Policy:** reset to an upstream **release tag**, replay only still-needed carries, validate, then cut over. `origin/main` drift is telemetry—not a stable-update target.
-- **Current state:** candidate validated; no upstream issue or PR identifiers are claimed here unless independently checked at submission time.
+- **Current state:** cutover complete at `f1fe98bcb8b1d9128f298052a0c7a6f83e49dcf3`; `execreations` and `sbosshardt/execreations` have zero divergence. No upstream issue or PR identifiers are claimed here unless independently checked at submission time.
 
 ## Candidate upstream contributions
 

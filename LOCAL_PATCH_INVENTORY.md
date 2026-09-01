@@ -3,8 +3,8 @@
 ## Release window
 
 - **Candidate baseline:** upstream `v2026.8.31` (Hermes Agent `v0.21.0`)
-- **Candidate branch:** `candidate/v2026.8.31-20260831T201409Z`
-- **Candidate status:** validated; production cutover pending
+- **Deployed commit:** `execreations` at `f1fe98bcb8b1d9128f298052a0c7a6f83e49dcf3`, synchronized with `sbosshardt/execreations`.
+- **Candidate status:** validated and deployed; the disposable candidate branch/worktree is no longer a deployment source of truth.
 - **Rollback branch:** `backup/pre-v2026.8.31-20260831T201409Z`
 - **Rollback tag:** `backup-pre-v2026.8.31-20260831T201409Z`
 - **Profile/state backup:** `/home/hermes/.hermes/backups/v2026.8.31-20260831T201409Z/`
@@ -48,7 +48,11 @@ Only the runtime behavior listed below is intentionally carried. Compatibility-o
 - [x] Dependency and embedded-Hindsight runtime validation complete in isolation.
 - [x] Candidate-focused tests pass.
 - [x] Canonical-suite failures compared to a clean release-tag baseline.
-- [ ] Move `execreations` to the validated candidate.
-- [ ] Sync active runtime dependencies, install `hindsight-embed==0.9.2`, migrate config to schema 39.
-- [ ] Push `execreations` to `sbosshardt/execreations` after explicit GitHub-write approval.
-- [ ] Restart and verify gateway, Telegram, Email, API, and Hindsight.
+- [x] Move `execreations` to the validated candidate.
+- [x] Sync active runtime dependencies, install `hindsight-embed==0.9.2`, and migrate config to schema 39.
+- [x] Push `execreations` to `sbosshardt/execreations` after explicit GitHub-write approval.
+- [x] Restart gateway; this Telegram session was restored successfully afterward.
+
+## Post-cutover evidence boundary
+
+The restart interrupted the in-flight verifier before separate Telegram, Email, API, and Hindsight connection lines could be captured. The restored gateway session confirms the cutover completed; treat per-adapter connection logging as routine-health-review evidence, not a reason to repeat the release restart.
