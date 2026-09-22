@@ -1165,6 +1165,14 @@ if __name__ == "__main__":
 class TestTemporaryAuthenticationRetry(unittest.TestCase):
     """Temporary DKIM DNS failures must remain safely retryable."""
 
+    def setUp(self):
+        # Fatal-status writes use an asynchronous worker. Without isolating it,
+        # the worker can create a file under a TemporaryDirectory while its
+        # cleanup is removing that directory (sporadic ENOTEMPTY).
+        status_patch = patch("gateway.status.publish_runtime_status")
+        status_patch.start()
+        self.addCleanup(status_patch.stop)
+
     def _make_adapter(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.email.adapter import EmailAdapter
