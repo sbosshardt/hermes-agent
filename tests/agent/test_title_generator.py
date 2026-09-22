@@ -205,6 +205,28 @@ class TestGenerateTitle:
             assert len(title) == 80
             assert title.endswith("...")
 
+    @pytest.mark.parametrize("content", [
+        '```json\n{"title": "Can you update Hermes Agent"}\n```',
+        'Can you update Hermes Agent',
+    ])
+    def test_conversational_model_title_uses_bounded_topic_from_opening(self, content):
+        response = MagicMock()
+        response.choices[0].message.content = content
+        opener = "I'd like for you to prepare to update Hermes Agent. Let me know the key changes."
+        with patch("agent.title_generator.call_llm", return_value=response):
+            assert generate_title(opener) == "prepare to update Hermes Agent"
+
+    def test_conversational_opener_without_topic_is_rejected_but_answer_guard_remains(self):
+        response = MagicMock()
+        with patch("agent.title_generator.call_llm", return_value=response):
+            response.choices[0].message.content = "Can you"
+            assert generate_title("Can you") is None
+            response.choices[0].message.content = (
+                "Could you perhaps explain the many different reasons why this error is happening "
+                "and how I can possibly fix it right now"
+            )
+            assert generate_title("Fix a Python import error") is None
+
     def test_rejects_answer_shaped_output(self):
         """A model that ignores the titling task and answers the user's
         message returns a full sentence; without a word bound the whole

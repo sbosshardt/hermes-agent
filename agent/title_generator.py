@@ -58,6 +58,10 @@ MAX_DERIVED_TITLE_CHARS = 48
 # answer-shaped output guard in generate_title; port of can1357/oh-my-pi#7306). 12 leaves headroom for
 # legitimate wordy titles while excluding full-sentence answers.
 _MAX_TITLE_WORDS = 12
+_CONVERSATIONAL_OPENER = re.compile(
+    r"^(?:can you|could you|would you|please|i(?:'d| would)? like(?: for you)? to|"
+    r"i need(?: you)? to|let us|let's)\b\s*", re.IGNORECASE,
+)
 # Output budget for the title call: room for a fenced/prefixed JSON reply and for a reasoning model that
 # thinks despite the thinking-disabled request, without letting a runaway reply burn minutes.
 TITLE_MAX_TOKENS = 512
@@ -369,6 +373,15 @@ def _clean_title(text: str) -> Optional[str]:
     return title or None
 
 
+def _topic_fallback(user_snippet: str) -> Optional[str]:
+    """Use only the first request clause, not an arbitrary later instruction."""
+    first = re.split(r"[.!?](?:\s|$)", user_snippet, maxsplit=1)[0].strip()
+    topic = _CONVERSATIONAL_OPENER.sub("", first).strip(" \"'.,:;!?()[]{}")
+    if not topic:
+        return None
+    return _clean_title(" ".join(topic.split()[:6]))
+
+
 def _safe_callback(callback: Optional[Callable], args: tuple, log_fmt: str, label: str) -> None:
     """Invoke an optional consumer callback, never raising."""
     try:
@@ -471,6 +484,12 @@ def generate_title(
             # Answer-shaped output: reject (not truncate) so the caller retries next exchange.
             logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), _MAX_TITLE_WORDS)
             return None
+        # Apply this only after extraction and the answer guard: never turn a
+        # truncated JSON/fence or a long answer into an apparently valid title.
+        if title is not None and _CONVERSATIONAL_OPENER.match(title):
+            title = _topic_fallback(user_snippet)
+            if title is None:
+                return None
         # Example-echo guard: a title that parrots one of the prompt's own
         # examples back verbatim says nothing about the session — reject it so
         # the instant derived title (a slice of the user's actual words)
