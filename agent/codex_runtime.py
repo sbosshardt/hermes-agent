@@ -623,7 +623,8 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
 
 
 def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: List[Dict[str, Any]],
-                              effective_task_id: str, should_review_memory: bool = False) -> Dict[str, Any]:
+                              effective_task_id: str, should_review_memory: bool = False,
+                              ext_prefetch_cache: str = "", plugin_user_context: str = "") -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
@@ -633,9 +634,15 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent, messages)
+    # Keep the transcript and fresh-thread history seed clean. The turn-start
+    # sidecar owns durable API content; only this submission receives it.
+    from agent.turn_context import compose_user_api_content
+    codex_user_input = compose_user_api_content(
+        user_message, ext_prefetch_cache, plugin_user_context,
+    ) or user_message
     try:
         _start_codex_thread(agent)
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(user_input=codex_user_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)

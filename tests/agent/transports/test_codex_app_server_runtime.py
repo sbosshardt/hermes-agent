@@ -92,6 +92,55 @@ class TestMaybeApplyCodexAppServerRuntime:
         )
 
 
+def test_codex_turn_uses_selected_context_only_on_wire_and_keeps_history_seed_clean(monkeypatch, tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    from agent import codex_runtime, turn_context
+    from agent.turn_context import compose_user_api_content
+    from agent.transports.codex_app_server_session import TurnResult
+    from run_agent import AIAgent
+    from hermes_state import SessionDB
+
+    db = SessionDB(Path(tmp_path) / "state.db")
+    sent = []
+    seeded = []
+    class FakeSession:
+        def ensure_started(self):
+            return "thread-1"
+        def run_turn(self, user_input):
+            sent.append(user_input)
+            return TurnResult(final_text="done", thread_id="thread-1", turn_id="turn-1",
+                              submitted_user_text=user_input, projected_messages=[
+                                  {"role": "user", "content": user_input},
+                                  {"role": "assistant", "content": "done"},
+                              ])
+
+    agent = AIAgent(api_key="stub", base_url="https://stub.invalid", provider="openai",
+                    api_mode="codex_app_server", quiet_mode=True, skip_context_files=True,
+                    skip_memory=True, session_db=db, session_id="session-codex-context")
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.build_system_prompt.return_value = ""
+    agent._memory_manager.describe_recall.return_value = ""
+    agent._memory_manager.prefetch_all.return_value = "selected memory"
+    monkeypatch.setattr(turn_context, "_maybe_title_session_at_turn_start", lambda *a: None)
+    monkeypatch.setattr(turn_context, "_collect_pre_llm_call_context", lambda *a, **kw: "plugin note")
+    monkeypatch.setattr(codex_runtime, "_ensure_codex_session",
+                        lambda _agent, messages: seeded.append([dict(m) for m in messages]))
+    agent._codex_session = FakeSession()
+    try:
+        assert agent.run_conversation("What did we decide about deployment?")["completed"]
+        assert sent == [compose_user_api_content(
+            "What did we decide about deployment?", "selected memory", "plugin note",
+        )]
+        assert len([m for m in seeded[0] if m["role"] == "user"]) == 1
+        assert seeded[0][-1]["content"] == "What did we decide about deployment?"
+        rows = db.get_messages(agent.session_id)
+        assert [(r["role"], r["content"]) for r in rows] == [
+            ("user", "What did we decide about deployment?"), ("assistant", "done")]
+    finally:
+        db.close()
+
+
 class TestCodexAppServerModule:
     """Module-surface tests for the JSON-RPC speaker. Don't require codex CLI."""
 
