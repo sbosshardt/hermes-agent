@@ -918,6 +918,17 @@ class TestMemoryContextFencing:
     """Prefetch context must be wrapped in <memory-context> fence so the model
     does not treat recalled memory as user discourse."""
 
+    def test_recalled_context_is_informational_not_authoritative(self):
+        from agent.memory_manager import build_memory_context_block
+
+        block = build_memory_context_block("user likes dark mode")
+        assert block.startswith("<memory-context>\n")
+        assert block.endswith("\n</memory-context>")
+        assert "NOT new user input" in block
+        assert "informational background data" in block
+        assert "authoritative reference data" not in block
+        assert "user likes dark mode" in block
+
 
     def test_sanitize_context_strips_fence_escapes(self):
         from agent.memory_manager import sanitize_context
