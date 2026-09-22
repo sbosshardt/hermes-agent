@@ -9,7 +9,7 @@ every interface (CLI, TUI, gateway) kept the agent marked "running" for
 minutes and any follow-up message triggered an aggressive interrupt that
 dropped the message.
 
-The fix dispatches provider work to a single-worker background executor.
+The fix dispatches writes and prefetches to separate single-worker executors.
 ``sync_all`` / ``queue_prefetch_all`` return immediately; the work completes
 (or fails, logged) in the background. ``flush_pending`` provides a barrier
 for session boundaries and deterministic tests. ``shutdown_all`` drains the
@@ -80,6 +80,132 @@ def test_background_work_still_completes():
     assert mgr.flush_pending(timeout=10) is True
     assert p.sync_done is True
     assert p.prefetch_done is True
+
+
+def test_prefetch_starts_while_sync_is_blocked():
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+    prefetch_started = threading.Event()
+
+    class _BlockingProvider(_SlowProvider):
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            sync_started.set()
+            assert release_sync.wait(timeout=5)
+
+        def queue_prefetch(self, query, *, session_id=""):
+            prefetch_started.set()
+
+    mgr = MemoryManager()
+    mgr.add_provider(_BlockingProvider(delay=0))
+    try:
+        mgr.sync_all("hi", "hey", session_id="s1")
+        assert sync_started.wait(timeout=2)
+        mgr.queue_prefetch_all("next", session_id="s1")
+        assert prefetch_started.wait(timeout=2)
+    finally:
+        release_sync.set()
+        assert mgr.flush_pending(timeout=5)
+
+
+def test_session_boundary_waits_for_prior_prefetch_before_switch():
+    prefetch_started = threading.Event()
+    release_prefetch = threading.Event()
+    boundary_done = threading.Event()
+    calls = []
+
+    class _BoundaryProvider(_SlowProvider):
+        def queue_prefetch(self, query, *, session_id=""):
+            prefetch_started.set()
+            assert release_prefetch.wait(timeout=5)
+            calls.append("prefetch")
+
+        def on_session_end(self, messages):
+            calls.append("end")
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            calls.append("switch")
+            boundary_done.set()
+
+    mgr = MemoryManager()
+    mgr.add_provider(_BoundaryProvider(delay=0))
+    try:
+        mgr.queue_prefetch_all("old", session_id="old")
+        assert prefetch_started.wait(timeout=2)
+        mgr.commit_session_boundary_async([{"role": "user", "content": "old"}], new_session_id="new")
+        # A sync-worker sentinel confirms that a boundary submitted before it
+        # cannot finish while the old prefetch is still using provider state.
+        assert not mgr.flush_pending(timeout=0.1)
+        assert not boundary_done.is_set()
+    finally:
+        release_prefetch.set()
+        assert mgr.flush_pending(timeout=5)
+    assert calls == ["prefetch", "end", "switch"]
+
+
+def test_new_session_prefetch_waits_for_boundary_rebind():
+    boundary_started = threading.Event()
+    release_boundary = threading.Event()
+    new_prefetch_started = threading.Event()
+    calls = []
+
+    class _BoundaryProvider(_SlowProvider):
+        def on_session_end(self, messages):
+            boundary_started.set()
+            assert release_boundary.wait(timeout=5)
+            calls.append("end")
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            calls.append("switch")
+
+        def queue_prefetch(self, query, *, session_id=""):
+            calls.append("prefetch")
+            new_prefetch_started.set()
+
+    mgr = MemoryManager()
+    mgr.add_provider(_BoundaryProvider(delay=0))
+    try:
+        mgr.commit_session_boundary_async([{"role": "user", "content": "old"}], new_session_id="new")
+        assert boundary_started.wait(timeout=2)
+        mgr.queue_prefetch_all("new query", session_id="new")
+        assert not mgr.flush_pending(timeout=0.1)
+        assert not new_prefetch_started.is_set()
+    finally:
+        release_boundary.set()
+        assert mgr.flush_pending(timeout=5)
+    assert calls == ["end", "switch", "prefetch"]
+
+
+def test_shutdown_accounts_for_queued_prefetch_on_separate_worker(monkeypatch, caplog):
+    import agent.memory_manager as memory_manager_module
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class _WedgedProvider(_SlowProvider):
+        def queue_prefetch(self, query, *, session_id=""):
+            if query == "active":
+                started.set()
+                release.wait(timeout=5)
+            calls.append(query)
+
+    monkeypatch.setattr(memory_manager_module, "_SYNC_DRAIN_TIMEOUT_S", 0.1)
+    mgr = MemoryManager()
+    mgr.add_provider(_WedgedProvider(delay=0))
+    try:
+        mgr.queue_prefetch_all("active")
+        assert started.wait(timeout=2)
+        mgr.queue_prefetch_all("queued")
+        with caplog.at_level(logging.WARNING, logger="agent.memory_manager"):
+            mgr.shutdown_all()
+        state = mgr.shutdown_drain_state
+        assert state["status"] == "timed_out"
+        assert state["abandoned_prefetches"] == 1
+        assert state["active_tasks"] == 1
+        assert "queued" not in calls
+        assert "1 queued prefetch" in caplog.text
+    finally:
+        release.set()
 
 
 
