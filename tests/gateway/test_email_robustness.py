@@ -2,7 +2,7 @@
 
 Validates that:
 - Malformed IMAP fetch responses are skipped instead of aborting the batch
-  (UIDs are marked seen before fetch, so an abort permanently loses messages)
+  (UIDs are explicitly acknowledged only after a successful fetch and authentication)
 - Message-ID generation handles a missing '@' in EMAIL_ADDRESS
 """
 
@@ -51,6 +51,8 @@ class TestImapResponseGuard(unittest.TestCase):
                 return ("OK", [uids])
             if command == "fetch":
                 return next(fetch_iter)
+            if command == "store":
+                return ("OK", [args[0]])
             return ("NO", [])
 
         mock_imap = MagicMock()
