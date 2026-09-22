@@ -15,6 +15,7 @@ import atexit
 import contextlib
 import json
 import logging
+import math
 import os
 import queue
 import sys
@@ -50,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_MODES = {"local", "local_embedded"}
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
+_PREFETCH_JOIN_TIMEOUT = 3.0
 
 
 def _ensure_client_dependency() -> None:
@@ -453,6 +455,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "prefetch_join_timeout", "description": "Max seconds to wait for a background prefetch on the next turn and session switch", "default": _PREFETCH_JOIN_TIMEOUT},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -784,6 +787,14 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
+        try:
+            join_timeout = float(cfg.get("prefetch_join_timeout", _PREFETCH_JOIN_TIMEOUT))
+            if not math.isfinite(join_timeout) or join_timeout < 0:
+                raise ValueError("prefetch join timeout must be finite and nonnegative")
+        except (TypeError, ValueError):
+            logger.warning("Invalid prefetch_join_timeout; using default %ss", _PREFETCH_JOIN_TIMEOUT)
+            join_timeout = _PREFETCH_JOIN_TIMEOUT
+        self._prefetch_join_timeout = join_timeout
         self._recall_tags = cfg.get("recall_tags") or None
         self._recall_tags_match = cfg.get("recall_tags_match", "any")
         self._auto_recall = cfg.get("auto_recall", True)
@@ -946,7 +957,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._recall_sync:
             return self._finish_prefetch(*(("", 0) if self._recall_disabled() else self._do_recall(query)))
         # Default: the background worker's result for the previous turn (capped join).
-        self._join_prefetch(3.0, log=True)
+        self._join_prefetch(self._prefetch_join_timeout, log=True)
         with self._prefetch_lock:
             result, count = self._prefetch_result, self._prefetch_count
             self._prefetch_result, self._prefetch_count = "", 0
@@ -1191,7 +1202,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._enqueue_retain(_flush)
 
         # 2. Drain the old session's in-flight prefetch and drop its result.
-        self._join_prefetch(3.0)
+        self._join_prefetch(self._prefetch_join_timeout)
         with self._prefetch_lock:
             self._prefetch_result = ""
 

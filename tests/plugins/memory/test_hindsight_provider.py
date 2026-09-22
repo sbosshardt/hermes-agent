@@ -620,6 +620,41 @@ class TestPrefetch:
         assert "buffered from previous turn" in result
         provider._client.arecall.assert_not_called()
 
+    def test_configured_join_waits_for_prefetch_result(self, provider_with_config):
+        p = provider_with_config(mode="local_external", prefetch_join_timeout=60.0)
+
+        class SlowPrefetch:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout):
+                # A recall that needs longer than the former fixed 3s window.
+                if timeout >= 60.0:
+                    with p._prefetch_lock:
+                        p._prefetch_result, p._prefetch_count = "- delayed memory", 1
+
+        p._prefetch_thread = SlowPrefetch()
+        assert "delayed memory" in p.prefetch("next turn")
+        assert p.recall_status().count == 1
+
+    def test_session_switch_uses_configured_bounded_join_and_discards_old_result(self, provider_with_config):
+        p = provider_with_config(mode="local_external", prefetch_join_timeout=60.0)
+        p._prefetch_result = "- stale old-session memory"
+        p._prefetch_count = 1
+
+        class PendingPrefetch:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout):
+                self.timeout = timeout
+
+        pending = PendingPrefetch()
+        p._prefetch_thread = pending
+        p.on_session_switch("new-session")
+        assert pending.timeout == 60.0
+        assert p.prefetch("new turn") == ""
+
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
         p.queue_prefetch("test")
