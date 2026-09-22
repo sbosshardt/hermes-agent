@@ -48,6 +48,17 @@ class TestComposeUserApiContent:
         fenced = build_memory_context_block("likes tea")
         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
 
+    @pytest.mark.parametrize(
+        ("memory", "plugin", "expected"),
+        [
+            (MagicMock(), MagicMock(), None),
+            ({"unexpected": "memory"}, "PLUGIN-CTX", "hello\n\nPLUGIN-CTX"),
+            ("likes tea", ["unexpected plugin"], "hello\n\n" + build_memory_context_block("likes tea")),
+        ],
+    )
+    def test_non_string_optional_context_does_not_break_composition(self, memory, plugin, expected):
+        assert compose_user_api_content("hello", memory, plugin) == expected
+
 
 
 

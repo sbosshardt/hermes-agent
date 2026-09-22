@@ -79,7 +79,7 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
 
 
 def compose_user_api_content(
-    content: Any, ext_prefetch_cache: str, plugin_user_context: str
+    content: Any, ext_prefetch_cache: Any, plugin_user_context: Any
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
@@ -87,6 +87,8 @@ def compose_user_api_content(
     (what turn N sends is what turn N+1 replays). ``None`` when nothing is injected."""
     if not isinstance(content, str):
         return None
+    ext_prefetch_cache = ext_prefetch_cache if isinstance(ext_prefetch_cache, str) else ""
+    plugin_user_context = plugin_user_context if isinstance(plugin_user_context, str) else ""
     fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
     injections = [part for part in (fenced, plugin_user_context) if part]
     if not injections:
