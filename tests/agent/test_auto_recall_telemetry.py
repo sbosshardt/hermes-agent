@@ -46,6 +46,14 @@ def test_prefetch_failure_is_observed_without_blocking_turn(monkeypatch, result,
     db.update_auto_recall_metrics.assert_called_once_with("s1", attempts=1, failures=1, latency_ms=125)
 
 
+def test_prefetch_metric_write_failure_is_reported_without_leaking_context(caplog):
+    agent, _, db = _agent(result="private remembered fact")
+    db.update_auto_recall_metrics.side_effect = OSError("disk full")
+    assert _memory_turn_start_and_prefetch(agent, "What did we decide?") == "private remembered fact"
+    assert "disk full" in caplog.text
+    assert "private remembered fact" not in caplog.text
+
+
 @pytest.mark.parametrize("query,boundary", [("hello", True), ("What did we decide?", False)])
 def test_no_attempt_for_trivial_or_unadmitted_turn(query, boundary):
     agent, manager, db = _agent(boundary=boundary)

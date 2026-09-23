@@ -5,6 +5,7 @@ import time
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_common import SCHEMA_SQL
 from agent.insights import (
     InsightsEngine,
     _estimate_cost,
@@ -14,6 +15,38 @@ from agent.usage_pricing import (
     format_duration_compact as _format_duration,
     has_known_pricing as _has_known_pricing,
 )
+
+
+def test_read_only_insights_on_unmigrated_legacy_sessions(tmp_path):
+    """A CLI read-only open cannot migrate the six new counters on an old store."""
+    columns = (
+        "auto_recall_attempt_count", "auto_recall_success_count", "auto_recall_failure_count",
+        "auto_recall_total_latency_ms", "auto_recall_min_latency_ms", "auto_recall_max_latency_ms",
+    )
+    path = tmp_path / "legacy.db"
+    legacy_sql = "\n".join(line for line in SCHEMA_SQL.splitlines()
+                           if not any(col in line for col in columns))
+    with sqlite3.connect(path) as conn:
+        conn.executescript(legacy_sql)
+        conn.execute("INSERT INTO sessions (id, source, model, started_at) VALUES (?, ?, ?, ?)",
+                     ("legacy", "cli", "gpt-4o", time.time()))
+    db = SessionDB(db_path=path, read_only=True)
+    try:
+        assert not set(columns) & {r[1] for r in db._conn.execute("PRAGMA table_info(sessions)")}
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30, source="cli")
+        assert report["empty"] is False
+        assert report["overview"]["total_sessions"] == 1
+        assert tuple(engine._get_sessions(0, "cli")[0][col] for col in columns) == (0, 0, 0, 0, None, 0)
+        assert report["memory_recall"] == {
+            "attempts": 0, "successes": 0, "failures": 0,
+            "failure_percentage": 0.0, "total_latency_ms": 0,
+            "min_latency_ms": 0, "avg_latency_ms": 0.0, "max_latency_ms": 0,
+        }
+        assert engine.format_terminal(report)
+        assert not set(columns) & {r[1] for r in db._conn.execute("PRAGMA table_info(sessions)")}
+    finally:
+        db.close()
 
 
 @pytest.fixture()

@@ -937,14 +937,27 @@ class SessionDB(
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
+    @contextmanager
+    def _write_lock(self, timeout_s: float):
+        """Bound local-mutex admission for best-effort writes; critical writes still wait."""
+        if not self._lock.acquire(timeout=max(0.0, timeout_s)):
+            raise TimeoutError("state.db local write lock unavailable for best-effort telemetry")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        *, lock_timeout_s: Optional[float] = None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
         immediately; on locked/busy the Python lock is released, a jitter slept,
-        and the WHOLE callback retried — *fn* must stay idempotent under retry."""
+        and the WHOLE callback retried — *fn* must stay idempotent under retry.
+        ``lock_timeout_s`` bounds admission to the local writer mutex for
+        best-effort callers; omitted for transcript-critical writes."""
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
@@ -970,7 +983,9 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._lock:
+                with (self._lock if lock_timeout_s is None else self._write_lock(
+                    min(lock_timeout_s, max(0.0, deadline - time.monotonic()))
+                )):
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")

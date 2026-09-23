@@ -900,8 +900,8 @@ def _memory_turn_start_and_prefetch(
                     latency_ms=latency_ms,
                 )
             except Exception as exc:
-                logger.debug("Auto-recall metrics persistence failed (session=%s): %s",
-                             agent.session_id, exc)
+                logger.warning("Auto-recall metrics persistence failed (session=%s): %s",
+                               agent.session_id, exc)
         logger.info("Auto-recall prefetch: session=%s success=%s latency_ms=%d context_chars=%d failure_reason=%s",
                     agent.session_id or "", success, latency_ms, len(ext_prefetch_cache), reason or "none")
     # Deterministic recall indicator via _emit_status so the model can't silently

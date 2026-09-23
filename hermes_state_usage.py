@@ -90,7 +90,6 @@ class SessionUsageMixin:
         attempts = max(int(attempts or 0), 0)
         failures = min(max(int(failures or 0), 0), attempts)
         latency_ms = None if latency_ms is None else max(int(latency_ms), 0)
-        self._insert_session_row(session_id, "unknown")
         sql = """UPDATE sessions SET
                auto_recall_attempt_count = COALESCE(auto_recall_attempt_count, 0) + ?,
                auto_recall_success_count = COALESCE(auto_recall_success_count, 0) + ?,
@@ -108,7 +107,11 @@ class SessionUsageMixin:
                WHERE id = ?"""
         params = (attempts, attempts - failures, failures, latency_ms,
                   latency_ms, latency_ms, latency_ms, latency_ms, latency_ms, session_id)
-        self._execute_write(lambda conn: conn.execute(sql, params))
+        def _write(conn):
+            if conn.execute(sql, params).rowcount != 1:
+                raise LookupError("auto-recall metrics: missing session")
+        self._execute_write(_write, patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
+                            lock_timeout_s=self._ACTIVITY_WRITE_PATIENCE_S)
 
     def update_session_billing_route(
         self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None,

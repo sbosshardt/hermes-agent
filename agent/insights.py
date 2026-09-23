@@ -84,6 +84,11 @@ def _scoped(before: str, after: str = "", *, src: str = " AND s.source = ?") -> 
 class InsightsEngine:
     """Analyzes session history from a SessionDB (or raw sqlite3 connection)."""
 
+    _RECALL_COLS = (
+        ("auto_recall_attempt_count", "0"), ("auto_recall_success_count", "0"),
+        ("auto_recall_failure_count", "0"), ("auto_recall_total_latency_ms", "0"),
+        ("auto_recall_min_latency_ms", "NULL"), ("auto_recall_max_latency_ms", "0"),
+    )
     _SESSION_COLS = ("id, source, model, started_at, ended_at, "
                      "message_count, tool_call_count, input_tokens, output_tokens, "
                      "cache_read_tokens, cache_write_tokens, billing_provider, "
@@ -156,6 +161,17 @@ class InsightsEngine:
     def __init__(self, db):
         self.db = db
         self._conn = db._conn
+        # Read-only SessionDB opens do not migrate older schemas. Keep the same
+        # row shape without writing or masking unrelated SQL/schema errors.
+        session_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+        if any(col not in session_columns for col, _ in self._RECALL_COLS):
+            projection = self._SESSION_COLS
+            for col, default in self._RECALL_COLS:
+                if col not in session_columns:
+                    projection = projection.replace(col, f"{default} AS {col}")
+            for suffix in ("_ALL", "_WITH_SOURCE"):
+                key = "_GET_SESSIONS" + suffix
+                setattr(self, key, getattr(self, key).replace(self._SESSION_COLS, projection))
         try:
             self._has_assistant_calls_index = bool(self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (self._MESSAGES_ASSISTANT_CALLS_INDEX,)).fetchone())
