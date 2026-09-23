@@ -47,6 +47,8 @@ def _nearest_enclosing_fn(tree: ast.AST) -> dict:
     def visit(node: ast.AST, current: str) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             current = node.name
+        elif isinstance(node, ast.Lambda):
+            current = "<lambda>"
         enclosing[id(node)] = current
         for child in ast.iter_child_nodes(node):
             visit(child, current)
@@ -56,8 +58,8 @@ def _nearest_enclosing_fn(tree: ast.AST) -> dict:
 
 
 def _unlocked_conn_calls(tree: ast.AST):
-    """Return (lineno, enclosing_fn, method) for each self._conn.<m>(...)
-    call that is not lexically inside a ``with self._lock:`` block."""
+    """Return (lineno, enclosing_fn, use) for unlocked writer calls or
+    direct connection handoffs inside lambdas."""
     locked_ids = set()
 
     def body_nodes(node):
@@ -86,24 +88,33 @@ def _unlocked_conn_calls(tree: ast.AST):
     enclosing = _nearest_enclosing_fn(tree)
 
     offending = []
+    def is_conn_attr(node):
+        return (isinstance(node, ast.Attribute)
+                and node.attr == "_conn"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self")
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if not (
-            isinstance(func, ast.Attribute)
-            and isinstance(func.value, ast.Attribute)
-            and func.value.attr == "_conn"
-            and isinstance(func.value.value, ast.Name)
-            and func.value.value.id == "self"
-        ):
+        is_direct_call = isinstance(func, ast.Attribute) and is_conn_attr(func.value)
+        # Direct connection handoffs in deferred lambdas are also unsafe;
+        # the sibling sweep covers handoffs outside lambda bodies.
+        is_lambda_handoff = enclosing.get(id(node)) == "<lambda>" and (
+            any(is_conn_attr(arg) for arg in node.args)
+            or any(is_conn_attr(keyword.value) for keyword in node.keywords)
+        )
+        if not (is_direct_call or is_lambda_handoff):
             continue
         if id(node) in locked_ids:
             continue
         fn = enclosing.get(id(node), "<module>")
         if fn in _ALLOWED_UNLOCKED_FNS:
             continue
-        offending.append((node.lineno, fn, func.attr))
+        use = (f"self._conn.{func.attr}(...)" if isinstance(func, ast.Attribute) and is_direct_call
+               else "self._conn passed to a deferred call")
+        offending.append((node.lineno, fn, use))
     return offending
 
 
@@ -117,7 +128,7 @@ def test_every_conn_call_outside_construction_holds_the_lock():
         "segfaults the process (#99349). Use `with self._read_ctx() as "
         "conn:` for reads, or take self._lock. Sites: "
         + ", ".join(
-            f"line {lineno} in {fn}(): self._conn.{meth}(...)"
-            for lineno, fn, meth in offending
+            f"line {lineno} in {fn}(): {use}"
+            for lineno, fn, use in offending
         )
     )

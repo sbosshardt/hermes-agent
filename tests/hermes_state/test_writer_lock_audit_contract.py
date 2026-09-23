@@ -57,6 +57,13 @@ def _source_variant(kind):
                  "                    if best_effort:\n")
         assert before in source
         source = source.replace(before, after, 1)
+    elif kind == "deferred_lambda_inside_conditional":
+        before = "                )):\n                    if best_effort:\n"
+        after = ("                )):\n"
+                 "                    callback = lambda: fn(self._conn)\n"
+                 "                    if best_effort:\n")
+        assert before in source
+        source = source.replace(before, after, 1)
     elif kind == "changed_conditional_arm":
         source = source.replace(CONDITIONAL, "with (nullcontext() if lock_timeout_s is None else self._write_lock(", 1)
     elif kind == "broken_helper":
@@ -73,7 +80,7 @@ def _source_variant(kind):
 @pytest.mark.parametrize("kind", [
     "real", "ordinary_unlocked", "conditional_in_other_method",
     "nested_conditional", "deferred_call_inside_conditional",
-    "changed_conditional_arm", "broken_helper",
+    "deferred_lambda_inside_conditional", "changed_conditional_arm", "broken_helper",
 ])
 def test_writer_lock_audit_only_trusts_verified_execute_write(
     audit, kind, tmp_path, monkeypatch,

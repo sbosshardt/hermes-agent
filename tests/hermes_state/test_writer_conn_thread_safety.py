@@ -183,12 +183,12 @@ class TestConcurrentReadersDoNotRaceTheWriter:
             def generic_visit(self, node):
                 locked = is_lock_with(node)
                 is_func = isinstance(
-                    node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
                 )
                 if locked:
                     self.lock_depth += 1
                 if is_func:
-                    self.func_stack.append(node.name)
+                    self.func_stack.append("<lambda>" if isinstance(node, ast.Lambda) else node.name)
                 # A nested function can be called after the surrounding lock
                 # is released; only its own with-blocks count as locked.
                 enclosing_lock_depth = self.lock_depth
