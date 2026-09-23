@@ -836,6 +836,10 @@ def _memory_turn_start_and_prefetch(
     Returns the prefetch text (``""`` when nothing was injected)."""
     if not agent._memory_manager:
         return ""
+    # The boundary is queued behind earlier sync writes. Do not tick the provider
+    # or read its cached prefetch while it is still bound to the old session.
+    if not agent._memory_manager.wait_for_session_boundary():
+        return ""
     _query = original_user_message if isinstance(original_user_message, str) else ""
     # The author rides along so a provider can attribute THIS turn, not whoever opened the session.
     _author = turn_author if isinstance(turn_author, dict) else {}

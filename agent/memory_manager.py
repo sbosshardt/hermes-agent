@@ -30,6 +30,7 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_SESSION_BOUNDARY_WAIT_TIMEOUT_S = 8.0
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -307,6 +308,7 @@ class MemoryManager:
         # within a bound, then report exactly what it abandoned.
         self._background_futures: Dict[Future, str] = {}
         self._last_prefetch_future: Optional[Future] = None
+        self._last_sync_future: Optional[Future] = None
         self._boundary_future: Optional[Future] = None
         self._shutting_down = False
         self._shutdown_drain_state: Dict[str, Any] = {
@@ -395,6 +397,8 @@ class MemoryManager:
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        if not self.wait_for_session_boundary():
+            return ""  # never consume provider cache from the old session
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -402,6 +406,19 @@ class MemoryManager:
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
         )
         return "\n\n".join(p for p in parts if p and p.strip())
+
+    def wait_for_session_boundary(self) -> bool:
+        """Bound a turn's wait for the latest rebind; skip memory if it is still pending."""
+        with self._sync_executor_lock:
+            boundary = self._boundary_future
+        if boundary is None:
+            return True
+        try:
+            boundary.result(timeout=_SESSION_BOUNDARY_WAIT_TIMEOUT_S)
+            return True
+        except Exception as exc:
+            logger.warning("Memory session boundary unavailable; skipping turn memory: %s", exc)
+            return False
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external
@@ -524,40 +541,47 @@ class MemoryManager:
                     except Exception as e:  # pragma: no cover - resource exhaustion
                         logger.warning("Failed to create memory %s executor: %s", kind, e)
                 executor = getattr(self, attr)
-        future = None
-        try:
-            # Submit+track atomically with the shutdown snapshot. The callback is attached
-            # outside the lock: an already-completed future invokes callbacks synchronously.
-            with self._sync_executor_lock:
-                if self._shutting_down:
-                    logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
-                    return
-                if executor is not None:
-                    # Writes still share FIFO order. Only session boundaries cross
-                    # workers: wait for earlier prefetch before rebinding provider
-                    # state, and hold later prefetch until that rebind completes.
-                    dependency = (self._last_prefetch_future if kind == "boundary" else
-                                  self._boundary_future if kind == "prefetch" else None)
-                    def _run_after_dependency():
-                        if dependency is not None:
-                            dependency.result()
-                        return fn()
-                    future = executor.submit(_run_after_dependency)
-                    self._background_futures[future] = kind
-                    if kind == "prefetch":
-                        self._last_prefetch_future = future
-                    elif kind == "boundary":
-                        self._boundary_future = future
-        except RuntimeError:
+        # Reserve a future even for inline fallback, under the same lock as submission.
+        # Otherwise a later prefetch can overtake an inline boundary while it waits
+        # for a queued sync, or a boundary can overtake an inline old prefetch.
+        inline = False
+        with self._sync_executor_lock:
             if self._shutting_down:
-                logger.warning("Memory manager shut down during %s submission; task rejected", kind)
+                logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
                 return
-        if future is not None:
-            future.add_done_callback(self._forget_background_future)
+            dependencies = ((self._last_sync_future, self._last_prefetch_future) if kind == "boundary"
+                            else (self._last_sync_future,) if kind == "write"
+                            else (self._boundary_future,))
+
+            def _run_after_dependency():
+                for dependency in dependencies:
+                    if dependency is not None:
+                        dependency.result()
+                return fn()
+
+            try:
+                if executor is None:
+                    raise RuntimeError("executor unavailable")
+                future = executor.submit(_run_after_dependency)
+            except Exception as exc:
+                logger.warning("Memory %s submission unavailable; running inline: %s", kind, exc)
+                future = Future()
+                future.set_running_or_notify_cancel()
+                inline = True
+            self._background_futures[future] = kind
+            if kind == "prefetch":
+                self._last_prefetch_future = future
+            else:
+                self._last_sync_future = future
+                if kind == "boundary":
+                    self._boundary_future = future
+        future.add_done_callback(self._forget_background_future)
+        if not inline:
             return
         try:
-            fn()
+            future.set_result(_run_after_dependency())
         except Exception as e:  # pragma: no cover - fn guards internally
+            future.set_exception(e)
             logger.debug("Inline memory background task failed: %s", e)
 
     def _forget_background_future(self, future: Future) -> None:

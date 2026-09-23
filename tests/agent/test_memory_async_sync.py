@@ -18,6 +18,7 @@ executor with a bounded timeout so a wedged provider can't hang teardown.
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -173,6 +174,234 @@ def test_new_session_prefetch_waits_for_boundary_rebind():
         release_boundary.set()
         assert mgr.flush_pending(timeout=5)
     assert calls == ["end", "switch", "prefetch"]
+
+
+def test_inline_boundary_waits_for_old_prefetch_when_executor_creation_fails(monkeypatch):
+    import tools.daemon_pool as daemon_pool
+
+    started, release, switched = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+
+    class Provider(_SlowProvider):
+        def queue_prefetch(self, query, *, session_id=""):
+            started.set()
+            assert release.wait(5)
+            calls.append("old prefetch")
+
+        def on_session_end(self, messages):
+            calls.append("end")
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            calls.append("switch")
+            switched.set()
+
+    mgr = MemoryManager()
+    mgr.add_provider(Provider(delay=0))
+    mgr.queue_prefetch_all("old", session_id="old")
+    assert started.wait(2)
+    attempted = threading.Event()
+
+    def reject(*args, **kwargs):
+        attempted.set()
+        raise RuntimeError("no worker")
+
+    monkeypatch.setattr(daemon_pool, "DaemonThreadPoolExecutor", reject)
+    boundary = threading.Thread(target=lambda: mgr.commit_session_boundary_async([], new_session_id="new"))
+    try:
+        boundary.start()
+        assert attempted.wait(2)
+        assert not switched.is_set()
+        release.set()
+        boundary.join(3)
+        assert not boundary.is_alive()
+        assert calls == ["old prefetch", "end", "switch"]
+    finally:
+        release.set()
+        boundary.join(3)
+        assert mgr.flush_pending(timeout=3)
+
+
+def test_inline_boundary_submission_failure_fences_new_prefetch_behind_sync(monkeypatch):
+    started, release, switched, prefetched = (threading.Event() for _ in range(4))
+    calls = []
+
+    class Provider(_SlowProvider):
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            started.set()
+            assert release.wait(5)
+            calls.append("sync")
+
+        def on_session_end(self, messages):
+            calls.append("end")
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            calls.append("switch")
+            switched.set()
+
+        def queue_prefetch(self, query, *, session_id=""):
+            calls.append("new prefetch")
+            prefetched.set()
+
+    mgr = MemoryManager()
+    mgr.add_provider(Provider(delay=0))
+    mgr.sync_all("old", "answer", session_id="old")
+    assert started.wait(2)
+    executor = mgr._sync_executor
+    assert executor is not None
+    original_submit = executor.submit
+    attempted = threading.Event()
+
+    def reject(fn):
+        attempted.set()
+        raise RuntimeError("rejected")
+
+    monkeypatch.setattr(executor, "submit", reject)
+    boundary = threading.Thread(target=lambda: mgr.commit_session_boundary_async([], new_session_id="new"))
+    try:
+        boundary.start()
+        assert attempted.wait(2)
+        with mgr._sync_executor_lock:
+            pass  # the rejected boundary has published its fallback fence
+        mgr.queue_prefetch_all("new query", session_id="new")
+        assert not switched.is_set()
+        assert not prefetched.is_set()
+        release.set()
+        boundary.join(3)
+        assert not boundary.is_alive()
+        assert prefetched.wait(3)
+        assert calls == ["sync", "end", "switch", "new prefetch"]
+    finally:
+        release.set()
+        boundary.join(3)
+        monkeypatch.setattr(executor, "submit", original_submit)
+        assert mgr.flush_pending(timeout=3)
+
+
+def test_turn_start_waits_for_queued_switch_before_reading_prefetch_cache():
+    from agent.turn_context import _memory_turn_start_and_prefetch
+
+    started, release, returned = (threading.Event() for _ in range(3))
+    calls, result = [], []
+
+    class Provider(_SlowProvider):
+        current = "old"
+
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            started.set()
+            assert release.wait(5)
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            self.current = new_session_id
+            calls.append("switch")
+
+        def on_turn_start(self, turn_number, message, **kwargs):
+            calls.append(("start", self.current))
+
+        def prefetch(self, query, *, session_id=""):
+            calls.append(("prefetch", self.current))
+            return self.current
+
+    mgr = MemoryManager()
+    mgr.add_provider(Provider(delay=0))
+    mgr.sync_all("old", "answer", session_id="old")
+    assert started.wait(2)
+    mgr.commit_session_boundary_async([], new_session_id="new")
+    agent = SimpleNamespace(_memory_manager=mgr, session_id="new", _user_turn_count=1,
+                            _emit_status=lambda text: None)
+
+    def run_turn():
+        result.append(_memory_turn_start_and_prefetch(agent, "What did we decide about deployment?"))
+        returned.set()
+
+    turn = threading.Thread(target=run_turn)
+    try:
+        turn.start()
+        assert not returned.is_set()
+        assert not calls
+        release.set()
+        assert returned.wait(3)
+        assert result == ["new"]
+        assert calls == ["switch", ("start", "new"), ("prefetch", "new")]
+    finally:
+        release.set()
+        turn.join(3)
+        assert mgr.flush_pending(timeout=3)
+
+
+def test_inline_old_prefetch_fences_queued_switch_when_executor_creation_fails(monkeypatch):
+    import tools.daemon_pool as daemon_pool
+
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    class Provider(_SlowProvider):
+        def queue_prefetch(self, query, *, session_id=""):
+            entered.set()
+            assert release.wait(5)
+            calls.append("prefetch")
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            calls.append("switch")
+
+    mgr = MemoryManager()
+    mgr.add_provider(Provider(delay=0))
+    original = daemon_pool.DaemonThreadPoolExecutor
+
+    def create(*args, **kwargs):
+        if kwargs.get("thread_name_prefix") == "mem-prefetch":
+            raise RuntimeError("no prefetch worker")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_pool, "DaemonThreadPoolExecutor", create)
+    prefetch = threading.Thread(target=lambda: mgr.queue_prefetch_all("old", session_id="old"))
+    try:
+        prefetch.start()
+        assert entered.wait(2)
+        mgr.commit_session_boundary_async([], new_session_id="new")
+        assert calls == []
+        release.set()
+        prefetch.join(3)
+        assert mgr.flush_pending(timeout=3)
+        assert calls == ["prefetch", "switch"]
+    finally:
+        release.set()
+        prefetch.join(3)
+
+
+def test_turn_start_skips_stale_memory_when_boundary_wait_expires(monkeypatch):
+    import agent.memory_manager as memory_manager_module
+    from agent.turn_context import _memory_turn_start_and_prefetch
+
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    class Provider(_SlowProvider):
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            started.set()
+            assert release.wait(5)
+
+        def on_turn_start(self, turn_number, message, **kwargs):
+            calls.append("tick")
+
+        def prefetch(self, query, *, session_id=""):
+            calls.append("prefetch")
+            return "old cache"
+
+    mgr = MemoryManager()
+    mgr.add_provider(Provider(delay=0))
+    mgr.sync_all("old", "answer", session_id="old")
+    assert started.wait(2)
+    mgr.commit_session_boundary_async([], new_session_id="new")
+    monkeypatch.setattr(memory_manager_module, "_SESSION_BOUNDARY_WAIT_TIMEOUT_S", 0)
+    agent = SimpleNamespace(_memory_manager=mgr, session_id="new", _user_turn_count=1)
+    try:
+        assert _memory_turn_start_and_prefetch(agent, "What did we decide about deployment?") == ""
+        assert calls == []
+        assert mgr.prefetch_all("What did we decide about deployment?", session_id="new") == ""
+        assert calls == []
+    finally:
+        release.set()
+        assert mgr.flush_pending(timeout=3)
 
 
 def test_shutdown_accounts_for_queued_prefetch_on_separate_worker(monkeypatch, caplog):
