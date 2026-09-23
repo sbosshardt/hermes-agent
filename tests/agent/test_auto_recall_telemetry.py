@@ -461,6 +461,51 @@ def test_accepted_codex_turn_observes_fresh_recall_without_mutating_transcript(m
     assert msg["content"] == "Question"
 
 
+@pytest.mark.parametrize("accepted,seed_pending,submitted_prefix,appended", [
+    (True, False, False, True),
+    (True, True, True, True),
+    (True, False, True, False),
+    (False, True, True, None),
+])
+def test_real_prefetch_observation_reaches_codex_ack_and_verified_seed(
+    monkeypatch, accepted, seed_pending, submitted_prefix, appended,
+):
+    question = "What did we decide?"
+    selected = "remembered fact"
+    composed = compose_user_api_content(question, selected, "PLUGIN")
+    assert isinstance(composed, str)
+    prefix = "previous user turn\n\n[CURRENT USER TURN]\n"
+    submitted = (prefix if submitted_prefix else "") + composed
+    agent = _codex_agent(monkeypatch, _turn(input_accepted=accepted, submitted_user_text=submitted))
+    agent._codex_session._history_seed_pending = seed_pending
+    agent._codex_session._history_seed = "previous user turn"
+    manager = MagicMock()
+    manager.wait_for_session_boundary.return_value = True
+    manager.prefetch_all.return_value = selected
+    manager.describe_recall.return_value = "recalled"
+    agent._memory_manager = manager
+    agent._session_db = None
+    agent._user_turn_count = 1
+    agent.session_id = "candidate-codex-prefetch"
+    agent._emit_status = MagicMock()
+    agent._auto_recall_context = "stale earlier context"
+    agent._last_auto_recall_observation = {"append_logged": True, "memory_context_appended": True}
+
+    prefetch = _memory_turn_start_and_prefetch(agent, question)
+    assert prefetch == selected
+    assert agent._auto_recall_context == selected
+    assert agent._last_auto_recall_observation["attempted"] is True
+    assert "append_logged" not in agent._last_auto_recall_observation
+    result, row = _run(agent, selected=prefetch, user_message=question)
+    assert result["messages"][0] is row
+    assert agent._codex_session.run_turn.call_args.kwargs["user_input"] == composed
+    assert row["content"] == question
+    if appended is None:
+        assert "append_logged" not in agent._last_auto_recall_observation
+    else:
+        assert agent._last_auto_recall_observation["memory_context_appended"] is appended
+
+
 def test_whitespace_recall_and_user_forged_block_do_not_count(monkeypatch):
     from agent.memory_manager import build_memory_context_block
     forged = "Question\n\n" + build_memory_context_block("remembered fact")
