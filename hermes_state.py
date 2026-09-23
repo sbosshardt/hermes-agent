@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, mkdir_under_hermes_home
@@ -947,9 +947,34 @@ class SessionDB(
         finally:
             self._lock.release()
 
+    @contextmanager
+    def _nonblocking_sqlite_writer(self, conn: sqlite3.Connection):
+        """Temporarily disable SQLite's 1s busy wait under the writer mutex.
+
+        The shared connection must be restored before releasing that mutex;
+        transcript writes retain their normal busy handler and repair behavior.
+        """
+        old_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            conn.execute("PRAGMA busy_timeout=0")
+            yield
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={old_timeout}")
+
+    def _raise_if_telemetry_generation_changed(self) -> None:
+        """Refuse stale WAL/file handles without normal forensic capture.
+
+        A later transcript write or close retains ownership of recovery. The caller
+        holds the writer mutex, like the normal generation probe.
+        """
+        if self._db_replaced or self._db_file_was_replaced():
+            raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
+        if self._db_wal_generation_lost or self._wal_generation_was_lost():
+            raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
-        *, lock_timeout_s: Optional[float] = None,
+        *, lock_timeout_s: Optional[float] = None, best_effort: bool = False,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
@@ -957,7 +982,8 @@ class SessionDB(
         immediately; on locked/busy the Python lock is released, a jitter slept,
         and the WHOLE callback retried — *fn* must stay idempotent under retry.
         ``lock_timeout_s`` bounds admission to the local writer mutex for
-        best-effort callers; omitted for transcript-critical writes."""
+        best-effort callers; omitted for transcript-critical writes. ``best_effort``
+        skips potentially long reopen/repair/checkpoint work and SQLite's busy handler."""
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
@@ -986,26 +1012,34 @@ class SessionDB(
                 with (self._lock if lock_timeout_s is None else self._write_lock(
                     min(lock_timeout_s, max(0.0, deadline - time.monotonic()))
                 )):
-                    self._raise_if_db_replaced()
+                    if best_effort:
+                        self._raise_if_telemetry_generation_changed()
+                    else:
+                        self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
+                        if best_effort:
+                            raise TimeoutError("state.db closed before best-effort telemetry write")
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                    with (self._nonblocking_sqlite_writer(self._conn) if best_effort
+                          else nullcontext()):
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            fn_started = True
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
                 # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
+                if not best_effort:
+                    self._write_count += 1
+                    if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                        self._try_wal_checkpoint()
+                    if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                        self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.
@@ -1033,6 +1067,8 @@ class SessionDB(
                     if "locked" in err_msg or "busy" in err_msg:
                         if self._sleep_before_write_retry(deadline, patience_s):
                             continue
+                        if best_effort:
+                            raise
                         # Say what actually happened, not disk/permission damage. The holder goes to
                         # the log, not the message: classify_persistence_error() buckets by phrase and
                         # a holder's argv (a worktree named fix-corrupt-db) would flip the bucket.
@@ -1054,6 +1090,8 @@ class SessionDB(
                         continue
                     raise  # non-lock error, callback already ran, or patience exhausted
                 if isinstance(exc, sqlite3.DatabaseError):
+                    if best_effort:
+                        raise  # no FTS detachment, replacement recovery or quarantine on telemetry
                     # An out-of-band replace surfaces as this same corruption class; in-file repair
                     # on a NEW generation amplifies the damage.
                     if (

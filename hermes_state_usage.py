@@ -111,7 +111,7 @@ class SessionUsageMixin:
             if conn.execute(sql, params).rowcount != 1:
                 raise LookupError("auto-recall metrics: missing session")
         self._execute_write(_write, patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
-                            lock_timeout_s=self._ACTIVITY_WRITE_PATIENCE_S)
+                            lock_timeout_s=self._ACTIVITY_WRITE_PATIENCE_S, best_effort=True)
 
     def update_session_billing_route(
         self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None,
