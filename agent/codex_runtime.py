@@ -622,6 +622,35 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
     return usage_result
 
 
+def _observe_codex_recall_append(agent, turn, *, selected_recall: str, composed_input: str,
+                                 history_seed: str, seed_pending: bool) -> None:
+    """Best-effort observation of this turn's acknowledged recall suffix, not DB accounting."""
+    observation = getattr(agent, "_last_auto_recall_observation", None)
+    if not isinstance(observation, dict) or observation.get("append_logged"):
+        return
+    if (getattr(turn, "input_accepted", False) is not True
+            or not isinstance(getattr(turn, "turn_id", None), str)
+            or not turn.turn_id.strip()):
+        return
+    context = getattr(agent, "_auto_recall_context", "")
+    from agent.memory_manager import build_memory_context_block
+    recall_block = build_memory_context_block(selected_recall) if isinstance(selected_recall, str) else ""
+    submitted = getattr(turn, "submitted_user_text", None)
+    expected = ((history_seed + "\n\n[CURRENT USER TURN]\n") if seed_pending and history_seed else "") + composed_input
+    appended = bool(recall_block and selected_recall == context
+                    and isinstance(submitted, str) and submitted == expected)
+    observation["append_logged"] = True
+    observation["memory_context_appended"] = appended
+    if appended:
+        observation["memory_context_chars"] = len(submitted)
+        logger.info("Auto-recall memory-context appended: session=%s chars=%d",
+                    getattr(agent, "session_id", None) or "", len(submitted))
+    else:
+        observation["append_failure_reason"] = "input_mismatch"
+        logger.info("Auto-recall memory-context append skipped: session=%s reason=input_mismatch",
+                    getattr(agent, "session_id", None) or "")
+
+
 def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: List[Dict[str, Any]],
                               effective_task_id: str, should_review_memory: bool = False,
                               ext_prefetch_cache: str = "", plugin_user_context: str = "",
@@ -637,15 +666,17 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     _ensure_codex_session(agent, messages)
     # Codex returns before the generic API-message builder. Keep the persisted
     # user row clean while preserving the actual input for fresh-thread recovery.
-    from agent.turn_context import compose_user_api_content, _mark_auto_recall_append
+    from agent.turn_context import compose_user_api_content
     codex_user_input = compose_user_api_content(
         user_message, ext_prefetch_cache, plugin_user_context,
     ) or user_message
     try:
         _start_codex_thread(agent)
-        if ext_prefetch_cache:
-            _mark_auto_recall_append(agent, codex_user_input)
-        turn = agent._codex_session.run_turn(user_input=codex_user_input)
+        session = agent._codex_session
+        seed_pending = getattr(session, "_history_seed_pending", False) is True
+        seed = getattr(session, "_history_seed", None)
+        history_seed = seed if seed_pending and isinstance(seed, str) else ""
+        turn = session.run_turn(user_input=codex_user_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)
@@ -653,6 +684,10 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
             final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
         )
+    _observe_codex_recall_append(
+        agent, turn, selected_recall=ext_prefetch_cache, composed_input=codex_user_input,
+        history_seed=history_seed, seed_pending=seed_pending,
+    )
     if getattr(turn, "input_accepted", False) and messages and messages[-1].get("role") == "user":
         # Persist only the actual current-turn wire payload once turn/start
         # acknowledges it. The one-shot historical prefix belongs to Codex's

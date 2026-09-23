@@ -6,6 +6,9 @@ the seed never makes the next turn retire the thread.
 """
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
 
 from agent import codex_runtime
 from agent.codex_runtime_history_seed import render_history_seed
@@ -250,3 +253,51 @@ def test_seeded_input_echo_is_not_persisted_as_synthetic_user_row():
     codex_runtime._persist_projected_messages(agent, turn, messages)
     assert [m["role"] for m in messages] == ["user", "assistant"]
     assert messages[0]["content"] == "current"
+
+
+@pytest.mark.parametrize("ack", ["accepted", "missing", "blank", "exception", "interrupt"])
+def test_runtime_recall_observation_tracks_real_turn_start_ack(monkeypatch, ack):
+    """A real app-server session controls acceptance, seed and submitted text."""
+    from agent.turn_context import compose_user_api_content
+    client = _FakeClient()
+    def request(method, params=None, timeout=None):
+        client.requests.append((method, params))
+        if method == "thread/start":
+            return {"thread": {"id": "fresh"}}
+        if ack == "exception":
+            raise sess_mod.CodexAppServerError(code=-1, message="not submitted")
+        return {"turn": {"id": "turn-1" if ack == "accepted" else "  " if ack == "blank" else None}}
+    client.request = request
+    session = sess_mod.CodexAppServerSession(
+        history_seed="prior history", client_factory=lambda **_: client,
+    )
+    session._run_started_turn = lambda result, *_: setattr(result, "error", "completion failed")
+    agent = MagicMock(compression_checkpoint_required=False)
+    agent._codex_session = session
+    agent._last_auto_recall_observation = {"attempted": True}
+    agent._auto_recall_context = "selected memory"
+    agent._session_db = None
+    agent._iters_since_skill = 0
+    agent._skill_nudge_interval = 0
+    agent.valid_tool_names = set()
+    monkeypatch.setattr(codex_runtime, "_ensure_codex_session", lambda *_: None)
+    monkeypatch.setattr(codex_runtime, "_start_codex_thread", lambda *_: session.ensure_started())
+    if ack == "interrupt":
+        session._interrupt_event.set()
+    msg = {"role": "user", "content": "Current question"}
+    result = codex_runtime.run_codex_app_server_turn(
+        agent, user_message="Current question", original_user_message="Current question",
+        messages=[msg], effective_task_id="task", ext_prefetch_cache="selected memory",
+    )
+    submitted = [p["input"][0]["text"] for m, p in client.requests if m == "turn/start"]
+    if ack == "accepted":
+        composed = compose_user_api_content("Current question", "selected memory", "")
+        assert submitted == ["prior history\n\n[CURRENT USER TURN]\n" + composed]
+        assert agent._last_auto_recall_observation["memory_context_appended"] is True
+        assert not result["completed"]  # completion failure follows accepted input
+    else:
+        assert "append_logged" not in agent._last_auto_recall_observation
+        assert not result["completed"]
+        if ack == "interrupt":
+            assert submitted == []
+    assert msg["content"] == "Current question"

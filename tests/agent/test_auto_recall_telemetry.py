@@ -364,9 +364,13 @@ def test_codex_early_return_injects_without_mutating_transcript():
     agent = MagicMock()
     agent.compression_checkpoint_required = False
     agent._codex_session.run_turn.return_value = SimpleNamespace(
+        input_accepted=True,
+        submitted_user_text=compose_user_api_content("Question", "remembered fact", "PLUGIN"),
         interrupted=False, error=None, should_retire=False, thread_id="thread",
         turn_id="turn", projected_messages=[], tool_iterations=0, final_text="ok",
     )
+    agent._codex_session._history_seed = ""
+    agent._codex_session._history_seed_pending = False
     agent._session_db = None
     agent._codex_session_prompt = None
     agent.tool_progress_callback = None
@@ -404,3 +408,164 @@ def test_codex_start_failure_does_not_claim_recall_was_appended(monkeypatch):
     assert result["completed"] is False
     agent._codex_session.run_turn.assert_not_called()
     assert "append_logged" not in agent._last_auto_recall_observation
+
+
+from agent.codex_runtime import run_codex_app_server_turn
+from agent.turn_context import compose_user_api_content
+
+
+def _turn(**overrides):
+    fields = dict(input_accepted=True, turn_id="turn-1", submitted_user_text="",
+                  interrupted=False, error=None, should_retire=False,
+                  thread_id="thread-1", projected_messages=[], tool_iterations=0,
+                  final_text="ok")
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _codex_agent(monkeypatch, turn):
+    monkeypatch.setattr("agent.codex_runtime._ensure_codex_session", lambda *_: None)
+    monkeypatch.setattr("agent.codex_runtime._start_codex_thread", lambda *_: None)
+    agent = MagicMock(compression_checkpoint_required=False)
+    agent._codex_session.run_turn.return_value = turn
+    agent._codex_session._history_seed = ""
+    agent._codex_session._history_seed_pending = False
+    agent._session_db = None
+    agent._iters_since_skill = 0
+    agent._skill_nudge_interval = 0
+    agent.valid_tool_names = set()
+    agent._last_auto_recall_observation = {"attempted": True}
+    agent._auto_recall_context = "remembered fact"
+    return agent
+
+
+def _run(agent, *, selected="remembered fact", user_message="Question", plugin="PLUGIN"):
+    msg = {"role": "user", "content": user_message}
+    result = run_codex_app_server_turn(
+        agent, user_message=user_message, original_user_message=user_message,
+        messages=[msg], effective_task_id="task", ext_prefetch_cache=selected,
+        plugin_user_context=plugin,
+    )
+    assert msg["content"] == user_message
+    return result, msg
+
+
+def test_accepted_codex_turn_observes_fresh_recall_without_mutating_transcript(monkeypatch):
+    composed = compose_user_api_content("Question", "remembered fact", "PLUGIN")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=composed))
+    result, msg = _run(agent)
+    assert result["completed"]
+    assert agent._codex_session.run_turn.call_args.kwargs["user_input"] == composed
+    assert agent._last_auto_recall_observation["memory_context_appended"] is True
+    assert agent._last_auto_recall_observation["append_logged"] is True
+    assert msg["content"] == "Question"
+
+
+def test_whitespace_recall_and_user_forged_block_do_not_count(monkeypatch):
+    from agent.memory_manager import build_memory_context_block
+    forged = "Question\n\n" + build_memory_context_block("remembered fact")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=forged))
+    agent._auto_recall_context = "  "
+    _, msg = _run(agent, selected="  ", user_message=forged, plugin="")
+    assert msg["content"] == forged
+    assert agent._last_auto_recall_observation["memory_context_appended"] is False
+
+
+@pytest.mark.parametrize("changes", [
+    {"input_accepted": False}, {"turn_id": None}, {"turn_id": "  "},
+])
+def test_unacknowledged_codex_input_is_not_observed(monkeypatch, changes):
+    composed = compose_user_api_content("Question", "remembered fact", "PLUGIN")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=composed, **changes))
+    _run(agent)
+    assert "append_logged" not in agent._last_auto_recall_observation
+
+
+def test_thread_start_exception_does_not_mark_append(monkeypatch):
+    agent = _codex_agent(monkeypatch, _turn())
+    def fail(_agent):
+        raise OSError("thread unavailable")
+    monkeypatch.setattr("agent.codex_runtime._start_codex_thread", fail)
+    monkeypatch.setattr("agent.codex_runtime._close_codex_session", lambda *_: None)
+    monkeypatch.setattr("agent.codex_runtime._consume_user_interrupt", lambda *_: (False, None))
+    result, _ = _run(agent)
+    assert not result["completed"]
+    agent._codex_session.run_turn.assert_not_called()
+    assert "append_logged" not in agent._last_auto_recall_observation
+
+
+def test_run_turn_exception_does_not_mark_append(monkeypatch):
+    agent = _codex_agent(monkeypatch, _turn())
+    agent._codex_session.run_turn.side_effect = OSError("before submission")
+    monkeypatch.setattr("agent.codex_runtime._close_codex_session", lambda *_: None)
+    monkeypatch.setattr("agent.codex_runtime._consume_user_interrupt", lambda *_: (False, None))
+    result, _ = _run(agent)
+    assert not result["completed"]
+    assert "append_logged" not in agent._last_auto_recall_observation
+
+
+def test_user_quoted_exact_recall_block_is_not_fresh_append(monkeypatch):
+    from agent.memory_manager import build_memory_context_block
+    quoted = "Question\n\n" + build_memory_context_block("remembered fact")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=quoted))
+    _run(agent, selected="", user_message=quoted, plugin="")
+    assert agent._last_auto_recall_observation["memory_context_appended"] is False
+
+
+def test_different_selected_recall_cannot_impersonate_current_context(monkeypatch):
+    stale = compose_user_api_content("Question", "older memory", "")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=stale))
+    _run(agent, selected="older memory", plugin="")
+    assert agent._last_auto_recall_observation["memory_context_appended"] is False
+
+
+@pytest.mark.parametrize("submitted", ["Question", None])
+def test_missing_or_different_wire_input_does_not_count(monkeypatch, submitted):
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=submitted))
+    _run(agent, plugin="")
+    assert agent._last_auto_recall_observation["memory_context_appended"] is False
+
+
+def test_accepted_input_logs_even_when_completion_and_db_fail(monkeypatch):
+    composed = compose_user_api_content("Question", "remembered fact", "PLUGIN")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=composed, error="completion failed",
+                                    projected_messages=[{"role": "assistant", "content": "partial"}]))
+    agent._session_db = MagicMock()
+    agent._flush_messages_to_session_db.return_value = False
+    result, _ = _run(agent)
+    assert not result["completed"]
+    agent._flush_messages_to_session_db.assert_called_once()
+    assert agent._last_auto_recall_observation["memory_context_appended"] is True
+    agent._session_db.update_auto_recall_metrics.assert_not_called()
+
+
+def test_fresh_history_seed_is_allowed_only_as_exact_prefix(monkeypatch):
+    composed = compose_user_api_content("Question", "remembered fact", "PLUGIN")
+    seed = "historical recalled text"
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=seed + "\n\n[CURRENT USER TURN]\n" + composed))
+    agent._codex_session._history_seed = seed
+    agent._codex_session._history_seed_pending = True
+    _run(agent)
+    assert agent._last_auto_recall_observation["memory_context_appended"] is True
+
+
+@pytest.mark.parametrize("submitted", [
+    "other historical text\n\n[CURRENT USER TURN]\n{composed}",
+    "historical recalled text\n\n[CURRENT USER TURN]\n{composed}\nmodified",
+    "historical recalled text\n\n[CURRENT USER TURN]\nQuestion",
+])
+def test_different_history_prefix_or_suffix_does_not_count(monkeypatch, submitted):
+    composed = compose_user_api_content("Question", "remembered fact", "PLUGIN")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=submitted.format(composed=composed)))
+    agent._codex_session._history_seed = "historical recalled text"
+    agent._codex_session._history_seed_pending = True
+    _run(agent)
+    assert agent._last_auto_recall_observation["memory_context_appended"] is False
+
+
+def test_stale_history_prefix_on_resumed_thread_does_not_count(monkeypatch):
+    composed = compose_user_api_content("Question", "remembered fact", "PLUGIN")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text="history\n\n[CURRENT USER TURN]\n" + composed))
+    agent._codex_session._history_seed = "history"
+    _run(agent)
+    assert agent._last_auto_recall_observation["memory_context_appended"] is False
