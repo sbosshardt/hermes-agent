@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agent.codex_runtime import run_codex_app_server_turn
+from agent.turn_context import compose_user_api_content
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -168,6 +169,71 @@ def test_codex_turn_persists_each_message_exactly_once():
         if db is not None:
             db.close()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_codex_sidecar_is_durable_only_after_turn_start_accepts_wire_input(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-ack"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        agent = _make_agent(db, sid)
+        agent._persist_user_message_override = None
+        agent._session_persist_lock = None
+        row = {"role": "user", "content": "clean question"}
+        db.append_message(sid, "user", "clean question")
+        row["_row_id"] = db.get_messages(sid)[-1]["id"]
+        wire = compose_user_api_content("[platform] clean question", "<selected-memory>fact</selected-memory>", "")
+        turn = _make_turn()
+        turn.input_accepted = False
+        agent._codex_session.run_turn.return_value = turn
+        run_codex_app_server_turn(agent, user_message="[platform] clean question",
+                                  original_user_message="clean question", messages=[row],
+                                  effective_task_id="task", ext_prefetch_cache="<selected-memory>fact</selected-memory>")
+        assert agent._codex_session.run_turn.call_args.kwargs["user_input"] == wire
+        assert row.get("api_content") is None
+        assert db.get_messages(sid)[0]["api_content"] is None
+
+        turn.input_accepted = True
+        agent._codex_session.run_turn.return_value = turn
+        run_codex_app_server_turn(agent, user_message="[platform] clean question",
+                                  original_user_message="clean question", messages=[row],
+                                  effective_task_id="task", ext_prefetch_cache="<selected-memory>fact</selected-memory>")
+        assert row["api_content"] == wire
+        assert db.get_messages(sid)[0]["api_content"] == wire
+        from agent.codex_runtime_history_seed import render_history_seed
+        loaded = db.get_messages_as_conversation(sid)
+        seed = render_history_seed(loaded + [{"role": "assistant", "content": "done"},
+                                             {"role": "user", "content": "next"}])
+        assert "<selected-memory>fact</selected-memory>" in seed
+        assert len([r for r in db.get_messages(sid) if r["role"] == "user"]) == 1
+    finally:
+        db.close()
+
+
+def test_compacted_codex_row_backfills_sidecar_and_provenance_together(tmp_path):
+    from agent.codex_runtime_history_seed import render_history_seed
+    from agent.turn_context import _stamp_api_content_sidecar
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-compacted-ack"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        db.append_message(sid, "user", "clean question")
+        agent = _make_agent(db, sid)
+        agent._persist_user_message_override = None
+        agent._session_persist_lock = None
+        agent._last_compaction_in_place = True
+        row = {"role": "user", "content": "clean question"}
+        wire = "[platform] clean question\n\n<selected-memory>fact</selected-memory>"
+        _stamp_api_content_sidecar(agent, [row], 0, "", "", preflight_compressed=True,
+                                   wire_content=wire)
+        assert db.get_messages(sid)[0]["api_content"] == wire
+        loaded = db.get_messages_as_conversation(sid)
+        seed = render_history_seed(loaded + [{"role": "assistant", "content": "done"},
+                                             {"role": "user", "content": "next"}])
+        assert "<selected-memory>fact</selected-memory>" in seed
+    finally:
+        db.close()
 
 
 class TestGatewayPersistedResolution:

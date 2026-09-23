@@ -55,7 +55,13 @@ def _agent(db, **kwargs):
 
 
 def _run_turn(self, user_input, **kwargs):
+    # The stand-in bypasses real turn/start; model its acknowledged lower-trust
+    # first-turn input so the runtime's deferred sidecar is exercised.
+    self._last_submitted_input = ((self._history_seed or "") + "\n\n[CURRENT USER TURN]\n" + user_input
+                                  if self._history_seed_pending else user_input)
+    self._history_seed_pending = False
     return TurnResult(final_text=f"echo {user_input}", thread_id=self._thread_id, turn_id="turn-1",
+                      input_accepted=True,
                       projected_messages=[{"role": "assistant", "content": f"echo {user_input}"}])
 
 
@@ -123,10 +129,11 @@ def test_fresh_thread_recovers_prior_sent_context_without_rewriting_transcript(m
         assert second.run_conversation("Summarize that.", conversation_history=history)["completed"]
         methods = _WireClient.instances[1].requests
         assert [m for m, _ in methods] == ["thread/resume", "thread/start"]
-        seed = methods[1][1]["developerInstructions"]
+        assert "What did we decide?" not in methods[1][1].get("developerInstructions", "")
+        seed = second._codex_session._last_submitted_input
         assert "What did we decide?" in seed
         assert "selected memory" in seed and "plugin note" in seed
-        assert "Summarize that." not in seed
+        assert seed.endswith("[CURRENT USER TURN]\nSummarize that.")
         assert "selected memory" not in db.get_messages(SID)[-2]["content"]
         assert db.get_messages(SID)[-2]["content"] == "Summarize that."
         assert db.get_messages(SID)[-2]["api_content"] is None

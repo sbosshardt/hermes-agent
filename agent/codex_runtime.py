@@ -652,6 +652,15 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
             final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
         )
+    if getattr(turn, "input_accepted", False) and messages and messages[-1].get("role") == "user":
+        # Persist only the actual current-turn wire payload once turn/start
+        # acknowledges it. The one-shot historical prefix belongs to Codex's
+        # thread, never to this Hermes user row or its api_content sidecar.
+        from agent.turn_context import _stamp_api_content_sidecar
+        _stamp_api_content_sidecar(
+            agent, messages, len(messages) - 1, "", "", preflight_compressed=False,
+            wire_content=codex_user_input,
+        )
     interrupt = _consume_user_interrupt(agent, turn.interrupted)
     # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool
     # silence alone no longer retires — it only logs a warning (#112928).

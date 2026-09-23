@@ -921,7 +921,7 @@ def _memory_turn_start_and_prefetch(
 
 def _stamp_api_content_sidecar(
     agent: Any, messages: List[Any], current_turn_user_idx: int, ext_prefetch_cache: str,
-    plugin_user_context: str, *, preflight_compressed: bool,
+    plugin_user_context: str, *, preflight_compressed: bool, wire_content: Optional[str] = None,
 ) -> None:
     """api_content sidecar — persist what you send: injected context lives only in the
     API copy, so stamp the exact sent bytes on the live dict for replay."""
@@ -931,11 +931,11 @@ def _stamp_api_content_sidecar(
     # Match the row the flush wrote (persist override = clean transcript), not the live bytes.
     durable_content, _api_content = durable_user_row_content(
         agent, _turn_user_msg, live_content,
-        compose_user_api_content(live_content or "", ext_prefetch_cache, plugin_user_context),
+        wire_content if wire_content is not None else compose_user_api_content(
+            live_content or "", ext_prefetch_cache, plugin_user_context),
     )
     if _api_content is None or _api_content == durable_content:
         return
-    _turn_user_msg["api_content"] = _api_content
 
     # When another writer materialized this turn's user row BEFORE the sidecar existed — in-place
     # preflight compaction, or a close/early flush that raced the prologue (#102194) — the crash
@@ -950,6 +950,13 @@ def _stamp_api_content_sidecar(
     # it, the stamp can land in between, see no id, return — and the flush then marks the message
     # persisted with ``api_content = NULL``, leaving no writer to correct the row.
     with _persist_lock(agent):
+        _turn_user_msg["api_content"] = _api_content
+        provenance_metadata = None
+        if wire_content is not None and isinstance(durable_content, str) and isinstance(_api_content, str):
+            from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
+            provenance_metadata = {**(_turn_user_msg.get("display_metadata") or {}),
+                                   SIDECAR_PROVENANCE_KEY: sidecar_provenance(durable_content, _api_content)}
+            _turn_user_msg["display_metadata"] = provenance_metadata
         _row_id = _turn_user_msg.get("_row_id")
         _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
         _db = getattr(agent, "_session_db", None)
@@ -957,11 +964,19 @@ def _stamp_api_content_sidecar(
             return
         try:
             if isinstance(_row_id, int):
-                _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content)
+                if provenance_metadata is not None:
+                    _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content,
+                                                display_metadata=provenance_metadata)
+                else:
+                    _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content)
             else:
                 # Compacted copies carry no row id; positional is safe only because
                 # archive_and_compact just made this message the newest active user row.
-                _db.set_latest_user_api_content(agent.session_id, durable_content, _api_content)
+                if provenance_metadata is not None:
+                    _db.set_latest_user_api_content(agent.session_id, durable_content, _api_content,
+                                                    display_metadata=provenance_metadata)
+                else:
+                    _db.set_latest_user_api_content(agent.session_id, durable_content, _api_content)
         except Exception:
             logger.warning("api_content backfill failed for session=%s", agent.session_id or "none", exc_info=True)
 
@@ -1129,11 +1144,11 @@ def build_turn_context(
     _bind_interrupt_scope(agent, ra)
     ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
 
-    # MoA has its own request assembly. Codex also needs the sidecar: if its
-    # thread cannot resume, the one-shot history seed must recover the context
-    # actually sent on earlier turns, not just their clean transcript text.
+    # MoA has its own request assembly. Codex stamps only after turn/start has
+    # accepted the input; before then the durable row is a pending clean turn.
     if (
         not moa_active
+        and agent.api_mode != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
     ):

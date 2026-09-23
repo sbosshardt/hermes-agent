@@ -51,6 +51,7 @@ class TurnResult:
     thread_id: Optional[str] = None
     # Exact turn/start text distinguishes the input echo from a new user event.
     submitted_user_text: Optional[str] = None
+    input_accepted: bool = False  # turn/start acknowledged this payload (not merely attempted)
     token_usage_last: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
@@ -234,9 +235,9 @@ class CodexAppServerSession:
         # inserts this as the first developer message of every model request. ``baseInstructions`` would
         # REPLACE codex's base and ``instructions`` is accepted but ignored (verified against codex 0.147).
         self._developer_instructions = developer_instructions
-        # Hermes' prior transcript, appended to developerInstructions ONLY when a thread is started from
-        # scratch: a resumed thread already holds the conversation (agent/codex_runtime_history_seed.py).
+        # Prior transcript is lower-trust first-turn user input on a fresh thread only.
         self._history_seed = history_seed
+        self._history_seed_pending = False
         self._permission_profile = permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
             os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"), "workspace-write"
         )
@@ -280,15 +281,13 @@ class CodexAppServerSession:
             thread_id = self._resume_thread(wanted, params)
             logger.info("codex app-server thread resumed: id=%s cwd=%s", thread_id[:8], self._cwd)
         else:
-            if self._history_seed:
-                params["developerInstructions"] = "\n\n".join(
-                    part for part in (params.get("developerInstructions"), self._history_seed) if part)
             result = self._client.request("thread/start", params, timeout=15)
             thread_id = _extract_thread_id(result)
             if not thread_id:
                 raise CodexAppServerError(
                     code=-32603, message=f"codex thread/start returned no thread id (payload keys: {sorted(result.keys())})",
                 )
+            self._history_seed_pending = bool(self._history_seed)
             logger.info("codex app-server thread started: id=%s profile=%s cwd=%s", thread_id[:8], self._permission_profile, self._cwd)
         self._thread_id = thread_id
         return thread_id
@@ -463,13 +462,28 @@ class CodexAppServerSession:
                 result.interrupted = True
             else:
                 input_items, result.submitted_user_text = _build_turn_input(user_input)
+                if self._history_seed_pending:
+                    # A single user text item avoids creating a second user event
+                    # in Codex's thread and lets the normal echo filter discard it.
+                    prefix = (self._history_seed or "") + "\n\n[CURRENT USER TURN]\n"
+                    input_items[0]["text"] = prefix + input_items[0]["text"]
+                    result.submitted_user_text = input_items[0]["text"]
                 ts = self._request_for(
                     result, "turn/start",
                     {"threadId": self._thread_id, "input": input_items},
                     "turn/start",
                 )
                 if ts is not None:
-                    self._run_started_turn(result, ts, turn_timeout, notification_poll_timeout, post_tool_quiet_timeout)
+                    turn = ts.get("turn") if isinstance(ts, dict) else None
+                    turn_id = turn.get("id") if isinstance(turn, dict) else None
+                    if not isinstance(turn_id, str) or not turn_id.strip():
+                        # No proof of input acceptance: keep the seed for retry.
+                        result.error = "codex turn/start returned no verifiable turn id"
+                    else:
+                        result.turn_id = turn_id
+                        result.input_accepted = True
+                        self._history_seed_pending = False
+                        self._run_started_turn(result, ts, turn_timeout, notification_poll_timeout, post_tool_quiet_timeout)
         self._interrupt_event.clear()
         return result
 

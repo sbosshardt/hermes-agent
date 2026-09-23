@@ -110,7 +110,7 @@ def test_codex_turn_keeps_visible_history_clean_and_persists_wire_sidecar(monkey
         def run_turn(self, user_input):
             sent.append(user_input)
             return TurnResult(final_text="done", thread_id="thread-1", turn_id="turn-1",
-                              submitted_user_text=user_input, projected_messages=[
+                              input_accepted=True, submitted_user_text=user_input, projected_messages=[
                                   {"role": "user", "content": user_input},
                                   {"role": "assistant", "content": "done"},
                               ])
