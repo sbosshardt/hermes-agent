@@ -605,6 +605,7 @@ class TestPrologueMoaAndInPlaceBackfill:
         agent = _FakeAgent()
         agent.compression_enabled = True
         agent._session_db = MagicMock()
+        agent._session_db.set_latest_user_api_content.return_value = 1
 
         calls = {"n": 0}
 

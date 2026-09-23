@@ -1136,7 +1136,8 @@ class SessionMessagesMixin:
         messages = []
         exact_user_clones: Dict[Tuple[Any, str], Dict[str, Any]] = {}
         for row in rows:
-            content = self._loaded_view_content(row["role"], self._decode_content(row["content"]))
+            raw_content = self._decode_content(row["content"])
+            content = self._loaded_view_content(row["role"], raw_content)
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).
             msg = {"role": row["role"], "content": content, _DB_PERSISTED_MARKER_KEY: True}
@@ -1149,6 +1150,20 @@ class SessionMessagesMixin:
                 msg["_row_id"] = row["id"]
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
+                if row["role"] == "user" and isinstance(decoded, dict):
+                    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
+                    marker = decoded.get(SIDECAR_PROVENANCE_KEY)
+                    if marker is not None:
+                        from agent.codex_runtime_history_seed import sidecar_provenance
+                        # Authenticate against the stored raw row FIRST. Distinct raw strings
+                        # can sanitize to the same visible text; a stale marker must not
+                        # become valid merely because the loader normalized a rewrite.
+                        decoded = dict(decoded)
+                        if (isinstance(raw_content, str) and isinstance(row["api_content"], str)
+                                and marker == sidecar_provenance(raw_content, row["api_content"])):
+                            decoded[SIDECAR_PROVENANCE_KEY] = sidecar_provenance(content, row["api_content"])
+                        else:
+                            decoded.pop(SIDECAR_PROVENANCE_KEY, None)
                 msg["display_metadata"] = decoded
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True

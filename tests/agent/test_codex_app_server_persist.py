@@ -25,6 +25,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 
 import tempfile
 from pathlib import Path
+from typing import Any
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 import pytest
@@ -305,6 +306,119 @@ def test_codex_ack_persists_wire_and_provenance_after_pending_clean_flush(tmp_pa
         db.close()
 
 
+@pytest.mark.parametrize("wire", [
+    "what does a literal <memory-context> tag do?",
+    "  spaced question \n",
+])
+def test_codex_ack_preserves_raw_wire_when_replay_normalizes_visible_text(tmp_path, wire):
+    from agent.codex_runtime_history_seed import render_history_seed
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-normalized-ack"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        agent = AIAgent(api_key="test-key", base_url="https://stub.invalid",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        session_db=db, session_id=sid)
+        agent.api_mode = "codex_app_server"
+        agent._session_db_created = True
+        agent._persist_user_message_idx = 0
+        agent._codex_session = MagicMock()
+        row = {"role": "user", "content": wire}
+        agent._flush_messages_to_session_db([row], None)
+        assert db.get_messages(sid)[0]["api_content"] is None
+        assert db.get_messages_as_conversation(sid)[0].get("api_content") is None
+
+        turn = _make_turn()
+        turn.input_accepted = True
+        agent._codex_session.run_turn.return_value = turn
+        result = run_codex_app_server_turn(agent, user_message=wire,
+                                            original_user_message=wire, messages=[row],
+                                            effective_task_id="task")
+        assert result["completed"] is True
+        assert agent._codex_session.run_turn.call_args.kwargs["user_input"] == wire
+        stored = db.get_messages(sid)[0]
+        loaded = db.get_messages_as_conversation(sid)[0]
+        assert loaded["content"] != wire
+        assert stored["api_content"] == loaded["api_content"] == wire
+        seed = render_history_seed([loaded, {"role": "assistant", "content": "ok"},
+                                    {"role": "user", "content": "next"}])
+        assert "[WIRE INPUT SENT WITH THIS PRIOR TURN" in seed
+        assert wire in seed
+    finally:
+        db.close()
+
+
+def test_codex_history_seed_rejects_provenance_after_raw_content_collision(tmp_path):
+    from agent.codex_runtime_history_seed import render_history_seed
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-raw-collision"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        raw = "question <memory-context>literal tag"
+        row_id = db.append_message(sid, "user", raw)
+        agent = _make_agent(db, sid)
+        agent._persist_user_message_override = None
+        agent._session_persist_lock = None
+        row = {"role": "user", "content": raw, "_row_id": row_id}
+        from agent.turn_context import _stamp_api_content_sidecar
+        _stamp_api_content_sidecar(agent, [row], 0, "", "", preflight_compressed=False,
+                                   wire_content=raw)
+        loaded = db.get_messages_as_conversation(sid)[0]
+        assert loaded["content"] != raw
+        assert raw in render_history_seed([loaded, {"role": "assistant", "content": "ok"},
+                                           {"role": "user", "content": "next"}])
+
+        # Different raw content maps to the same replay view. A provenance
+        # match solely against normalized text would leak the old sidecar.
+        db.set_user_message_content(sid, row_id, loaded["content"])
+        rewritten = db.get_messages_as_conversation(sid)[0]
+        assert rewritten["content"] == loaded["content"]
+        seed = render_history_seed([rewritten, {"role": "assistant", "content": "ok"},
+                                    {"role": "user", "content": "next"}])
+        assert raw not in seed
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("accepted,keeps_sidecar", [
+    ("clean question", False),
+    ("  clean question \n", True),
+])
+def test_codex_clean_retry_clears_stale_sidecar_only_when_equivalent_on_reload(
+    tmp_path, accepted, keeps_sidecar,
+):
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
+    from agent.turn_context import _stamp_api_content_sidecar
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-normalized-clean-retry"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        raw = "  clean question \n"
+        old_wire = "old wire\n\nold memory"
+        row_id = db.append_message(sid, "user", raw, api_content=old_wire,
+                                   display_metadata={SIDECAR_PROVENANCE_KEY:
+                                                     sidecar_provenance(raw, old_wire)})
+        agent = _make_agent(db, sid)
+        agent._persist_user_message_override = None
+        agent._session_persist_lock = None
+        row = {"role": "user", "content": raw, "_row_id": row_id,
+               "api_content": old_wire,
+               "display_metadata": {SIDECAR_PROVENANCE_KEY: sidecar_provenance(raw, old_wire)}}
+        _stamp_api_content_sidecar(agent, [row], 0, "", "", preflight_compressed=False,
+                                   wire_content=accepted)
+        assert row.get("api_content") == (accepted if keeps_sidecar else None)
+        assert (SIDECAR_PROVENANCE_KEY in row.get("display_metadata", {})) == keeps_sidecar
+        loaded = db.get_messages_as_conversation(sid)[0]
+        assert loaded["content"] == "clean question"
+        assert loaded.get("api_content") == (accepted if keeps_sidecar else None)
+        assert (SIDECAR_PROVENANCE_KEY in loaded.get("display_metadata", {})) == keeps_sidecar
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("preflight_compressed", [False, True])
 def test_codex_ack_backfills_in_place_compaction_copy_without_row_id(tmp_path, preflight_compressed):
     from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
@@ -338,6 +452,81 @@ def test_codex_ack_backfills_in_place_compaction_copy_without_row_id(tmp_path, p
         db.close()
 
 
+@pytest.mark.parametrize("row_id_retained", [True, False])
+def test_codex_ack_backfills_actual_in_place_compacted_content_despite_clean_override(tmp_path, row_id_retained):
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, render_history_seed, sidecar_provenance
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-real-compaction-override"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        db.append_message(sid, "user", "old turn")
+        live = "[platform] clean question"
+        clean = "clean question"
+        # The real compactor inserts the copied live message, not the normal
+        # flush's clean persist override. The insert may stamp its row id.
+        copied = {"role": "user", "content": live}
+        db.archive_and_compact(sid, [copied])
+        assert db.get_messages(sid)[0]["content"] == live
+        if not row_id_retained:
+            copied.pop("_row_id", None)  # marker-swept handoff can lose the id
+        agent = _make_agent(db, sid)
+        agent._persist_user_message_override = clean
+        agent._session_persist_lock = None
+        agent._last_compaction_in_place = True
+        turn = _make_turn()
+        turn.input_accepted = True
+        agent._codex_session.run_turn.return_value = turn
+        result = run_codex_app_server_turn(
+            agent, user_message=live, original_user_message=clean, messages=[copied],
+            effective_task_id="task", preflight_compressed=True,
+            ext_prefetch_cache="<selected-memory>fact</selected-memory>",
+        )
+        wire = agent._codex_session.run_turn.call_args.kwargs["user_input"]
+        assert result["completed"] is True
+        stored = db.get_messages(sid)[0]
+        assert stored["content"] == live
+        assert stored["api_content"] == wire
+        assert stored["display_metadata"][SIDECAR_PROVENANCE_KEY] == sidecar_provenance(live, wire)
+        loaded = db.get_messages_as_conversation(sid)[0]
+        seed = render_history_seed([loaded, {"role": "assistant", "content": "ok"},
+                                    {"role": "user", "content": "next"}])
+        assert "<selected-memory>fact</selected-memory>" in seed
+        assert "[CONTEXT SENT WITH THIS PRIOR TURN" in seed
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("stale_row_id", [True, False])
+def test_codex_ack_stale_compacted_row_id_does_not_stamp_newest_row(tmp_path, stale_row_id):
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
+    from agent.turn_context import _stamp_api_content_sidecar
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-stale-compacted-id"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        old_id = db.append_message(sid, "user", "[platform] clean question")
+        db.archive_and_compact(sid, [{"role": "user", "content": (
+            "[platform] clean question" if stale_row_id else "another turn")}])
+        agent = _make_agent(db, sid)
+        agent._persist_user_message_override = "clean question"
+        agent._session_persist_lock = None
+        agent._last_compaction_in_place = True
+        row: dict[str, Any] = {"role": "user", "content": "[platform] clean question"}
+        if stale_row_id:
+            row["_row_id"] = old_id
+        _stamp_api_content_sidecar(agent, [row], 0, "", "", preflight_compressed=True,
+                                   wire_content="[platform] clean question\n\nrecalled fact")
+        stored = db.get_messages(sid)[0]
+        assert stored["api_content"] is None
+        assert SIDECAR_PROVENANCE_KEY not in (stored["display_metadata"] or {})
+        assert row.get("api_content") is None
+        assert SIDECAR_PROVENANCE_KEY not in (row.get("display_metadata") or {})
+    finally:
+        db.close()
+
+
 def test_codex_conversation_compaction_ack_backfills_row_idless_copy(tmp_path, monkeypatch):
     """Carry a preflight compaction result through the real turn loop and Codex runtime."""
     from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
@@ -360,11 +549,12 @@ def test_codex_conversation_compaction_ack_backfills_row_idless_copy(tmp_path, m
 
         def compact_in_place(_agent, *, messages, current_turn_user_idx, active_system_prompt,
                              conversation_history, **_kwargs):
-            # Model the compactor's durable write and copied live message without a row id.
-            db.append_message(sid, "user", "clean question")
+            # Model the compactor's actual in-place write of copied live
+            # content; archive_and_compact stamps the new durable row id.
             _agent._last_compaction_in_place = True
             copied = [{"role": "user", "content": "[platform] clean question",
                        _DB_PERSISTED_MARKER: True}]
+            db.archive_and_compact(sid, copied)
             return CompactionOutcome(copied, active_system_prompt, conversation_history, 0,
                                      compressed=True)
 
@@ -373,12 +563,12 @@ def test_codex_conversation_compaction_ack_backfills_row_idless_copy(tmp_path, m
                                         persist_user_message="clean question")
         assert result["completed"] is True
         stored = db.get_messages(sid)[0]
-        assert stored["content"] == "clean question"
-        assert stored["api_content"] == agent._codex_session.run_turn.call_args.kwargs["user_input"]
-        assert stored["api_content"] == "[platform] clean question"
+        assert stored["content"] == "[platform] clean question"
+        assert stored["api_content"] is None
+        assert agent._codex_session.run_turn.call_args.kwargs["user_input"] == "[platform] clean question"
         assert len([row for row in db.get_messages(sid) if row["role"] == "user"]) == 1
-        assert SIDECAR_PROVENANCE_KEY in stored["display_metadata"]
-        assert db.get_messages_as_conversation(sid)[0]["api_content"] == stored["api_content"]
+        assert SIDECAR_PROVENANCE_KEY not in (stored["display_metadata"] or {})
+        assert db.get_messages_as_conversation(sid)[0].get("api_content") is None
     finally:
         db.close()
 

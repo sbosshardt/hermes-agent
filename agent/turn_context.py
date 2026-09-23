@@ -954,7 +954,24 @@ def _stamp_api_content_sidecar(
             # Only the acknowledged Codex call supplies wire_content. The flush must not
             # infer a sidecar from the pending clean row before this point.
             _turn_user_msg["_codex_input_accepted"] = True
-        if _api_content is None or _api_content == durable_content:
+        _row_id = _turn_user_msg.get("_row_id")
+        _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
+        _db = getattr(agent, "_session_db", None)
+        if _db is not None and _in_place_compacted:
+            # archive_and_compact inserted the copied live message verbatim. Unlike
+            # an ordinary flush, it never applied the clean transcript override.
+            # Its insert can also stamp _row_id on the copy; still match the
+            # committed live bytes, and let the row-id guard reject a stale id.
+            durable_content = live_content
+        # Codex submits the exact accepted string, while a DB reload presents
+        # sanitized/stripped visible text. Equality to the raw row is not enough
+        # to omit the sidecar when the loader would change those wire bytes.
+        if codex_accepted and isinstance(durable_content, str):
+            from agent.memory_manager import sanitize_context
+            equivalent = _api_content == sanitize_context(durable_content).strip()
+        else:
+            equivalent = _api_content == durable_content
+        if _api_content is None or equivalent:
             if not codex_accepted:
                 return
             # An adopted unanswered row may contain the previous attempt's wire bytes.
@@ -975,26 +992,31 @@ def _stamp_api_content_sidecar(
             else:
                 live_metadata[SIDECAR_PROVENANCE_KEY] = marker
             _turn_user_msg["display_metadata"] = live_metadata
-        _row_id = _turn_user_msg.get("_row_id")
-        _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
-        _db = getattr(agent, "_session_db", None)
         if _db is None or not (isinstance(_row_id, int) or _in_place_compacted):
             return
         try:
             if isinstance(_row_id, int):
                 if provenance_metadata is not None:
-                    _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content,
-                                                display_metadata=provenance_metadata)
+                    updated = _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content,
+                                                          display_metadata=provenance_metadata)
                 else:
-                    _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content)
+                    updated = _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content)
             else:
                 # Compacted copies carry no row id; positional is safe only because
                 # archive_and_compact just made this message the newest active user row.
                 if provenance_metadata is not None:
-                    _db.set_latest_user_api_content(agent.session_id, durable_content, _api_content,
-                                                    display_metadata=provenance_metadata)
+                    updated = _db.set_latest_user_api_content(agent.session_id, durable_content, _api_content,
+                                                              display_metadata=provenance_metadata)
                 else:
-                    _db.set_latest_user_api_content(agent.session_id, durable_content, _api_content)
+                    updated = _db.set_latest_user_api_content(agent.session_id, durable_content, _api_content)
+            if updated != 1:
+                # The guarded write found no current matching row. In particular do
+                # not retry positionally when a stale row id was supplied.
+                logger.warning("api_content backfill matched no row for session=%s", agent.session_id or "none")
+                _turn_user_msg.pop("api_content", None)
+                if provenance_metadata is not None:
+                    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
+                    _turn_user_msg["display_metadata"].pop(SIDECAR_PROVENANCE_KEY, None)
         except Exception:
             logger.warning("api_content backfill failed for session=%s", agent.session_id or "none", exc_info=True)
 
