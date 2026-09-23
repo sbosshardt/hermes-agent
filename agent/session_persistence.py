@@ -206,7 +206,22 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     if pending_codex_user:
         api_content = None
     if api_content == content:
-        api_content = None
+        # A late first flush can see the acknowledged wire on the live Codex row before
+        # any DB row exists. Equality to raw content does not imply equality on reload:
+        # replay sanitizes/strips that content. Require both the ACK and its exact
+        # content/wire provenance before preserving this otherwise redundant sidecar.
+        preserve_acked_codex_wire = False
+        if (is_current_turn_user and role == "user"
+                and getattr(agent, "api_mode", None) == "codex_app_server"
+                and msg.get("_codex_input_accepted") and isinstance(content, str)
+                and api_content is not None and sanitize_context(content).strip() != content):
+            from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
+            metadata = msg.get("display_metadata")
+            preserve_acked_codex_wire = (isinstance(metadata, dict)
+                                         and metadata.get(SIDECAR_PROVENANCE_KEY)
+                                         == sidecar_provenance(content, api_content))
+        if not preserve_acked_codex_wire:
+            api_content = None
     # get_messages_as_conversation replays rows through sanitize_context().strip(); capture the sent bytes
     # when they would differ (compared in wire form).
     if (

@@ -349,6 +349,64 @@ def test_codex_ack_preserves_raw_wire_when_replay_normalizes_visible_text(tmp_pa
         db.close()
 
 
+@pytest.mark.parametrize("wire", [
+    "what does a literal <memory-context> tag do?",
+    "  spaced question \n",
+])
+def test_codex_late_first_flush_preserves_acknowledged_raw_wire(tmp_path, monkeypatch, wire):
+    """A failed turn-start INSERT cannot turn pending input into an accepted sidecar."""
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, render_history_seed, sidecar_provenance
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-late-first-flush"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        agent = AIAgent(api_key="test-key", base_url="https://stub.invalid",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        session_db=db, session_id=sid)
+        agent.api_mode = "codex_app_server"
+        agent._session_db_created = True
+        agent._persist_user_message_idx = 0
+        agent._codex_session = MagicMock()
+        row = {"role": "user", "content": wire}
+        messages = [row]
+        insert = db.append_messages_batch
+
+        def fail_initial_insert(*args, **kwargs):
+            raise OSError("simulated turn-start INSERT failure")
+
+        monkeypatch.setattr(db, "append_messages_batch", fail_initial_insert)
+        # The real flush catches DB errors so the turn can still be submitted.
+        agent._flush_messages_to_session_db(messages, None)
+        monkeypatch.setattr(db, "append_messages_batch", insert)
+        assert db.get_messages(sid) == []
+        assert row.get("api_content") is None
+        assert row.get("_row_id") is None
+
+        turn = _make_turn()
+        turn.input_accepted = True
+        agent._codex_session.run_turn.return_value = turn
+        result = run_codex_app_server_turn(agent, user_message=wire,
+                                            original_user_message=wire, messages=messages,
+                                            effective_task_id="task")
+        assert result["completed"] is True
+        assert agent._codex_session.run_turn.call_args.kwargs["user_input"] == wire
+        stored = [r for r in db.get_messages(sid) if r["role"] == "user"]
+        assert len(stored) == 1
+        assert stored[0]["content"] == wire
+        assert stored[0]["api_content"] == wire
+        assert stored[0]["display_metadata"][SIDECAR_PROVENANCE_KEY] == sidecar_provenance(wire, wire)
+        loaded = db.get_messages_as_conversation(sid)[0]
+        assert loaded["content"] != wire
+        assert loaded["api_content"] == wire
+        seed = render_history_seed([loaded, {"role": "assistant", "content": "ok"},
+                                    {"role": "user", "content": "next"}])
+        assert "[WIRE INPUT SENT WITH THIS PRIOR TURN" in seed
+        assert wire in seed
+    finally:
+        db.close()
+
+
 def test_codex_history_seed_rejects_provenance_after_raw_content_collision(tmp_path):
     from agent.codex_runtime_history_seed import render_history_seed
 
