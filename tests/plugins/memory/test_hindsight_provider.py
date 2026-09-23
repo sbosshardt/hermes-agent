@@ -655,6 +655,32 @@ class TestPrefetch:
         assert pending.timeout == 60.0
         assert p.prefetch("new turn") == ""
 
+    def test_late_old_session_prefetch_cannot_publish_after_switch(self, provider_with_config, monkeypatch):
+        p = provider_with_config(prefetch_join_timeout=0)
+        recall_started = threading.Event()
+        release_old_recall = threading.Event()
+
+        def recall(query):
+            recall_started.set()
+            assert release_old_recall.wait(timeout=5), "old recall was never released"
+            return "- old-session memory", 1
+
+        monkeypatch.setattr(p, "_do_recall", recall)
+        p.queue_prefetch("old turn", session_id="test-session")
+        old_worker = p._prefetch_thread
+        try:
+            assert recall_started.wait(timeout=5), "old recall never started"
+            p.on_session_switch("new-session")  # bounded join returns while old worker is blocked
+            assert old_worker.is_alive()
+            assert p.prefetch("new turn", session_id="new-session") == ""
+        finally:
+            # Release strictly after the switch, even on assertion failure.
+            release_old_recall.set()
+            old_worker.join(timeout=5)
+        assert not old_worker.is_alive()
+        assert p.prefetch("another new turn", session_id="new-session") == ""
+        assert p.recall_status() is None
+
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
         p.queue_prefetch("test")

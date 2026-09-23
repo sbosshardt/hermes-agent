@@ -368,6 +368,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
         self._prefetch_result, self._prefetch_count = "", 0
         self._prefetch_lock = threading.Lock()
+        self._prefetch_generation = 0
         self._prefetch_thread = None
         self._last_recall_returned, self._last_recall_count = False, 0
         self._apply_recall_settings({})
@@ -974,6 +975,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._recall_sync or self._recall_disabled():
             return
 
+        with self._prefetch_lock:
+            generation = self._prefetch_generation
+
         def _run():
             # Wait (bounded, off the reply path) for the just-completed turn's
             # retain to be recall-visible so the warmed context includes it.
@@ -982,7 +986,8 @@ class HindsightMemoryProvider(MemoryProvider):
             text, count = self._do_recall(query)
             if text:
                 with self._prefetch_lock:
-                    self._prefetch_result, self._prefetch_count = text, count
+                    if generation == self._prefetch_generation:
+                        self._prefetch_result, self._prefetch_count = text, count
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -1204,7 +1209,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # 2. Drain the old session's in-flight prefetch and drop its result.
         self._join_prefetch(self._prefetch_join_timeout)
         with self._prefetch_lock:
-            self._prefetch_result = ""
+            # A bounded join may leave the old worker alive; reject any later
+            # publication from it as well as clearing results already written.
+            self._prefetch_generation += 1
+            self._prefetch_result, self._prefetch_count = "", 0
 
         # 3. Rotate to the new session.
         if parent_session_id:

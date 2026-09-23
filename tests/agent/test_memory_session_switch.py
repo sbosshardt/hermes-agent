@@ -187,6 +187,9 @@ def _make_hindsight_provider():
     provider._prefetch_thread = None
     provider._prefetch_lock = threading.Lock()
     provider._prefetch_result = ""
+    provider._prefetch_count = 0
+    provider._prefetch_generation = 0
+    provider._prefetch_join_timeout = 3.0
     # Sync thread tracking (legacy alias at the writer).
     provider._sync_thread = None
     # Writer queue infra the flush-on-switch path enqueues onto. We stub
