@@ -1525,6 +1525,7 @@ def _run_conversation_turn(
             should_review_memory=s._should_review_memory,
             ext_prefetch_cache=s._ext_prefetch_cache,
             plugin_user_context=s._plugin_user_context,
+            preflight_compressed=_ctx.preflight_compressed,
         )
         from agent.turn_recovery import activate_codex_app_server_fallback
         if not activate_codex_app_server_fallback(agent, codex_result):

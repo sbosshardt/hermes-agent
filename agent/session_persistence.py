@@ -194,16 +194,23 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
     timestamp = msg.get("timestamp")
+    # Codex has not sent this current turn until turn/start acknowledges it. Neither the
+    # clean-transcript override nor sanitize-divergence can infer an unsent wire payload.
+    pending_codex_user = (is_current_turn_user and role == "user"
+                          and getattr(agent, "api_mode", None) == "codex_app_server"
+                          and not msg.get("_codex_input_accepted"))
     if is_current_turn_user and role == "user":
         content, api_content = durable_user_row_content(agent, msg, content, api_content)
         ov_timestamp = getattr(agent, "_persist_user_message_timestamp", None)
         timestamp = timestamp if ov_timestamp is None else ov_timestamp
+    if pending_codex_user:
+        api_content = None
     if api_content == content:
         api_content = None
     # get_messages_as_conversation replays rows through sanitize_context().strip(); capture the sent bytes
     # when they would differ (compared in wire form).
     if (
-        api_content is None and role in ("user", "assistant") and isinstance(content, str) and content
+        not pending_codex_user and api_content is None and role in ("user", "assistant") and isinstance(content, str) and content
         and sanitize_context(content).strip() != content.strip()
     ):
         api_content = content

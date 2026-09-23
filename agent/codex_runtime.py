@@ -624,7 +624,8 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
 
 def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: List[Dict[str, Any]],
                               effective_task_id: str, should_review_memory: bool = False,
-                              ext_prefetch_cache: str = "", plugin_user_context: str = "") -> Dict[str, Any]:
+                              ext_prefetch_cache: str = "", plugin_user_context: str = "",
+                              preflight_compressed: bool = False) -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
@@ -658,7 +659,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         # thread, never to this Hermes user row or its api_content sidecar.
         from agent.turn_context import _stamp_api_content_sidecar
         _stamp_api_content_sidecar(
-            agent, messages, len(messages) - 1, "", "", preflight_compressed=False,
+            agent, messages, len(messages) - 1, "", "", preflight_compressed=preflight_compressed,
             wire_content=codex_user_input,
         )
     interrupt = _consume_user_interrupt(agent, turn.interrupted)

@@ -479,6 +479,7 @@ class TurnContext:
     plugin_user_context: str = ""  # ``pre_llm_call`` context (appended to user message)
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
+    preflight_compressed: bool = False  # actual compaction; guards row-id-less Codex backfill
 
 
 def _persist_under_lock(agent: Any, fn, failure_msg: str, pending_cli_message: Any) -> None:
@@ -934,8 +935,6 @@ def _stamp_api_content_sidecar(
         wire_content if wire_content is not None else compose_user_api_content(
             live_content or "", ext_prefetch_cache, plugin_user_context),
     )
-    if _api_content is None or _api_content == durable_content:
-        return
 
     # When another writer materialized this turn's user row BEFORE the sidecar existed — in-place
     # preflight compaction, or a close/early flush that raced the prologue (#102194) — the crash
@@ -950,13 +949,32 @@ def _stamp_api_content_sidecar(
     # it, the stamp can land in between, see no id, return — and the flush then marks the message
     # persisted with ``api_content = NULL``, leaving no writer to correct the row.
     with _persist_lock(agent):
-        _turn_user_msg["api_content"] = _api_content
+        codex_accepted = wire_content is not None
+        if codex_accepted:
+            # Only the acknowledged Codex call supplies wire_content. The flush must not
+            # infer a sidecar from the pending clean row before this point.
+            _turn_user_msg["_codex_input_accepted"] = True
+        if _api_content is None or _api_content == durable_content:
+            if not codex_accepted:
+                return
+            # An adopted unanswered row may contain the previous attempt's wire bytes.
+            # A clean accepted retry must clear that stale claim, including provenance.
+            _api_content = None
+            _turn_user_msg.pop("api_content", None)
+        else:
+            _turn_user_msg["api_content"] = _api_content
         provenance_metadata = None
-        if wire_content is not None and isinstance(durable_content, str) and isinstance(_api_content, str):
+        if codex_accepted:
             from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
-            provenance_metadata = {**(_turn_user_msg.get("display_metadata") or {}),
-                                   SIDECAR_PROVENANCE_KEY: sidecar_provenance(durable_content, _api_content)}
-            _turn_user_msg["display_metadata"] = provenance_metadata
+            marker = (sidecar_provenance(durable_content, _api_content)
+                      if isinstance(durable_content, str) and isinstance(_api_content, str) else None)
+            provenance_metadata = {SIDECAR_PROVENANCE_KEY: marker}  # DB patch, not a stale live snapshot
+            live_metadata = dict(_turn_user_msg.get("display_metadata") or {})
+            if marker is None:
+                live_metadata.pop(SIDECAR_PROVENANCE_KEY, None)
+            else:
+                live_metadata[SIDECAR_PROVENANCE_KEY] = marker
+            _turn_user_msg["display_metadata"] = live_metadata
         _row_id = _turn_user_msg.get("_row_id")
         _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
         _db = getattr(agent, "_session_db", None)
@@ -1170,6 +1188,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context, ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=compaction.blocked,
+        preflight_compressed=compaction.compressed,
     )
 
 

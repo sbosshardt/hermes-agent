@@ -280,9 +280,9 @@ class TestPrologueStamping:
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
 
-    def test_stamp_for_codex_app_server_preserves_selected_context(self):
-        """Codex now sends selected context in turn/start; a fresh thread's
-        history seed needs the same bytes while the visible row stays clean."""
+    def test_codex_prologue_keeps_selected_context_pending_until_ack(self):
+        """Codex composes selected context at turn/start, not in the prologue;
+        an unaccepted request must not claim those bytes in its history seed."""
         agent = _FakeAgent()
         agent.api_mode = "codex_app_server"
         with patch(
@@ -292,8 +292,9 @@ class TestPrologueStamping:
             ctx = _build(agent)
         row = ctx.messages[ctx.current_turn_user_idx]
         assert row["content"] == "hello"
-        assert row["api_content"] == "hello\n\nPLUGIN-CTX"
-        assert agent.api_content_at_persist == row["api_content"]
+        assert ctx.plugin_user_context == "PLUGIN-CTX"
+        assert "api_content" not in row
+        assert agent.api_content_at_persist is None
 
 
 # ---------------------------------------------------------------------------
