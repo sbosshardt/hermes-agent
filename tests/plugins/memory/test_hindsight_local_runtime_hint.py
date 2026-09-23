@@ -22,7 +22,9 @@ def test_hint_for_missing_hindsight_all():
 
 def test_hint_for_missing_hindsight_embed():
     hint = _local_runtime_hint("No module named 'hindsight_embed.daemon_embed_manager'")
-    assert "hindsight-all" in hint
+    assert "hindsight-embed" in hint
+    assert "hindsight-all" not in hint
+    assert sys.executable in hint
 
 
 def test_no_hint_for_unrelated_runtime_error():

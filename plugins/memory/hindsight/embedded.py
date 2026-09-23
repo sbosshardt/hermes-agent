@@ -8,7 +8,9 @@ import importlib
 import logging
 import os
 import sys
+from importlib.metadata import version as _embed_distribution_version
 from pathlib import Path
+from shutil import which as _which_launcher
 from typing import Any
 
 from agent.secret_scope import UnscopedSecretError, get_secret
@@ -62,29 +64,37 @@ def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
 
 
 def _check_local_runtime() -> tuple[bool, str | None]:
-    """Whether the local embedded stack imports cleanly (older CPUs: NumPy can raise
-    at import, so Hermes degrades instead of retrying a broken backend).
-    ``sentence_transformers`` is probed too: ``hindsight`` imports fine with a broken
-    embedding stack, and the daemon would then abort on every retain/recall."""
+    """Check the lightweight wrapper and its selected launcher, without starting it.
+
+    In hindsight-embed 0.9.x the API/ML stack lives in an isolated uvx
+    environment, not necessarily in the Hermes venv. Importing ``hindsight``
+    or ``sentence_transformers`` here would reject a healthy installation.
+    """
     try:
-        for module in ("hindsight", "hindsight_embed.daemon_embed_manager", "sentence_transformers"):
-            importlib.import_module(module)
+        manager_module = importlib.import_module("hindsight_embed.daemon_embed_manager")
+        api_version = _embed_distribution_version("hindsight-embed")
+        command = manager_module.DaemonEmbedManager()._find_api_command(api_version)
+        if not command:
+            return False, "Hindsight embedded API launcher was not resolved"
+        launcher = str(command[0])
+        if not ((Path(launcher).is_file() and os.access(launcher, os.X_OK))
+                or _which_launcher(launcher) is not None):
+            return False, f"Hindsight embedded API launcher is unavailable: {launcher}"
         return True, None
     except Exception as exc:
         return False, str(exc)
 
 
 def _local_runtime_hint(reason: str | None) -> str:
-    """Install guidance when the local_embedded runtime is missing: ``plugin.yaml``
-    declares only ``hindsight-client``, so a hand-written config, the legacy
-    ``"mode": "local"`` alias or a restored backup hits ``No module named 'hindsight'``.
-
-    ``local_embedded`` imports ``from hindsight import HindsightEmbedded``, which is provided only by the
-    ``hindsight-all`` package (its wheel ships the top-level ``hindsight`` module).
-    NousResearch/hermes-agent#7718.
-    """
+    """Install guidance for a missing wrapper or legacy top-level runtime."""
     text = (reason or "").lower()
-    if "no module named" in text and any(m in text for m in ("hindsight'", 'hindsight"', "hindsight_embed")):
+    if "no module named" in text and "hindsight_embed" in text:
+        return (
+            f" Install the embedded wrapper with: uv pip install --python "
+            f"{sys.executable} hindsight-embed — or run 'hermes memory setup'. "
+            "The API/ML stack may run in a separate uvx environment."
+        )
+    if "no module named" in text and any(m in text for m in ("hindsight'", 'hindsight"')):
         return (
             f" Install the embedded runtime with: uv pip install --python "
             f"{sys.executable} hindsight-all — or run 'hermes memory setup'. "
