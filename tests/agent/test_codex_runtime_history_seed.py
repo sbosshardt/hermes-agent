@@ -8,6 +8,7 @@ the seed never makes the next turn retire the thread.
 from types import SimpleNamespace
 
 from agent import codex_runtime
+from agent.codex_runtime_history_seed import render_history_seed
 from agent.transports import codex_app_server_session as sess_mod
 
 
@@ -40,6 +41,18 @@ _HISTORY = [
     {"role": "tool", "content": "saved"},
     {"role": "user", "content": "what is my dog called?"},  # the turn being submitted
 ]
+
+
+def test_history_seed_ignores_sidecar_that_no_longer_matches_visible_user_turn():
+    rows = [
+        {"role": "user", "content": "Corrected question", "api_content": "Old question\n\n<other-session-memory>secret</other-session-memory>"},
+        {"role": "assistant", "content": "Corrected reply"},
+        {"role": "user", "content": "Current question"},
+    ]
+    seed = render_history_seed(rows)
+    assert "Corrected question" in seed
+    assert "other-session-memory" not in seed
+    assert "Old question" not in seed
 
 
 def test_fresh_thread_is_seeded_with_prior_turns_but_not_the_current_one(monkeypatch):

@@ -634,8 +634,8 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent, messages)
-    # Keep the transcript and fresh-thread history seed clean. The turn-start
-    # sidecar owns durable API content; only this submission receives it.
+    # The turn-start sidecar preserves what was sent for a later fresh-thread
+    # seed; the visible transcript remains the clean user message.
     from agent.turn_context import compose_user_api_content
     codex_user_input = compose_user_api_content(
         user_message, ext_prefetch_cache, plugin_user_context,

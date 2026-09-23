@@ -1073,10 +1073,11 @@ def build_turn_context(
     _bind_interrupt_scope(agent, ra)
     ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
 
-    # Sidecar skipped for codex_app_server/MoA.
+    # MoA has its own request assembly. Codex also needs the sidecar: if its
+    # thread cannot resume, the one-shot history seed must recover the context
+    # actually sent on earlier turns, not just their clean transcript text.
     if (
         not moa_active
-        and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
     ):

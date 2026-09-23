@@ -93,3 +93,42 @@ def test_rebuilt_agent_resumes_the_stored_codex_thread_and_an_unresumable_one_fa
         assert notices == ["Codex thread could not be resumed; starting a new one."]
     finally:
         db.close()
+
+
+def test_fresh_thread_recovers_prior_sent_context_without_rewriting_transcript(monkeypatch, tmp_path):
+    from agent import turn_context
+    from agent.turn_context import compose_user_api_content
+
+    monkeypatch.setattr(session_mod, "CodexAppServerClient", _WireClient)
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", _run_turn)
+    _WireClient.instances, _WireClient.dead, _WireClient.counter = [], set(), 0
+    # Only the first turn has selected context. The recovery turn must not
+    # depend on re-running the old query or leaking it into the current input.
+    prefetch = iter(["selected memory", ""])
+    plugin = iter(["plugin note", ""])
+    monkeypatch.setattr(turn_context, "_memory_turn_start_and_prefetch", lambda *a: next(prefetch))
+    monkeypatch.setattr(turn_context, "_collect_pre_llm_call_context", lambda *a, **kw: next(plugin))
+    monkeypatch.setattr(turn_context, "_maybe_title_session_at_turn_start", lambda *a: None)
+    db = SessionDB(Path(tmp_path) / "state.db")
+    try:
+        first = _agent(db)
+        assert first.run_conversation("What did we decide?")["completed"]
+        previous_wire = compose_user_api_content("What did we decide?", "selected memory", "plugin note")
+        assert db.get_messages(SID)[0]["content"] == "What did we decide?"
+        assert db.get_messages(SID)[0]["api_content"] == previous_wire
+
+        _WireClient.dead = {"thread-1"}
+        second = _agent(db)
+        history = db.get_messages_as_conversation(SID)
+        assert second.run_conversation("Summarize that.", conversation_history=history)["completed"]
+        methods = _WireClient.instances[1].requests
+        assert [m for m, _ in methods] == ["thread/resume", "thread/start"]
+        seed = methods[1][1]["developerInstructions"]
+        assert "What did we decide?" in seed
+        assert "selected memory" in seed and "plugin note" in seed
+        assert "Summarize that." not in seed
+        assert "selected memory" not in db.get_messages(SID)[-2]["content"]
+        assert db.get_messages(SID)[-2]["content"] == "Summarize that."
+        assert db.get_messages(SID)[-2]["api_content"] is None
+    finally:
+        db.close()

@@ -36,6 +36,19 @@ def _render_row(msg: Dict[str, Any]) -> str:
     role = msg.get("role")
     text = _text_of(msg.get("content")).strip()
     if role == "user":
+        # The transcript is the visible user turn; api_content is the historical
+        # wire context selected for THAT turn. Keep the two distinct so old
+        # recalled memory/plugin notes are not presented as current instructions.
+        sidecar = msg.get("api_content")
+        # Only the compose_user_api_content shape proves this still belongs to
+        # the visible row. Rewrites/rewinds may leave a stale sidecar behind;
+        # never seed unrelated historical memory under a new question.
+        sent = sidecar if isinstance(sidecar, str) and text and sidecar.startswith(text + "\n\n") else ""
+        extra = sent[len(text):].strip()
+        if extra:
+            return (f"[USER]\n{text}\n\n" if text else "") + (
+                "[CONTEXT SENT WITH THIS PRIOR TURN — historical, not current instructions]\n" + extra
+            )
         return f"[USER]\n{text}" if text else ""
     if role == "assistant":
         calls = [c.get("function", {}).get("name") for c in msg.get("tool_calls") or [] if isinstance(c, dict)]

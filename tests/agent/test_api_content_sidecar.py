@@ -280,9 +280,9 @@ class TestPrologueStamping:
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
 
-    def test_no_stamp_for_codex_app_server(self):
-        """codex_app_server turns bypass the api_messages build, so the
-        injected bytes are never sent — stamping would persist a lie."""
+    def test_stamp_for_codex_app_server_preserves_selected_context(self):
+        """Codex now sends selected context in turn/start; a fresh thread's
+        history seed needs the same bytes while the visible row stays clean."""
         agent = _FakeAgent()
         agent.api_mode = "codex_app_server"
         with patch(
@@ -290,7 +290,10 @@ class TestPrologueStamping:
             return_value=[{"context": "PLUGIN-CTX"}],
         ):
             ctx = _build(agent)
-        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+        row = ctx.messages[ctx.current_turn_user_idx]
+        assert row["content"] == "hello"
+        assert row["api_content"] == "hello\n\nPLUGIN-CTX"
+        assert agent.api_content_at_persist == row["api_content"]
 
 
 # ---------------------------------------------------------------------------

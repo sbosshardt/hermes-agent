@@ -92,7 +92,7 @@ class TestMaybeApplyCodexAppServerRuntime:
         )
 
 
-def test_codex_turn_uses_selected_context_only_on_wire_and_keeps_history_seed_clean(monkeypatch, tmp_path):
+def test_codex_turn_keeps_visible_history_clean_and_persists_wire_sidecar(monkeypatch, tmp_path):
     from pathlib import Path
     from unittest.mock import MagicMock
     from agent import codex_runtime, turn_context
@@ -137,6 +137,7 @@ def test_codex_turn_uses_selected_context_only_on_wire_and_keeps_history_seed_cl
         rows = db.get_messages(agent.session_id)
         assert [(r["role"], r["content"]) for r in rows] == [
             ("user", "What did we decide about deployment?"), ("assistant", "done")]
+        assert rows[0]["api_content"] == sent[0]
     finally:
         db.close()
 
