@@ -634,14 +634,16 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent, messages)
-    # The turn-start sidecar preserves what was sent for a later fresh-thread
-    # seed; the visible transcript remains the clean user message.
-    from agent.turn_context import compose_user_api_content
+    # Codex returns before the generic API-message builder. Keep the persisted
+    # user row clean while preserving the actual input for fresh-thread recovery.
+    from agent.turn_context import compose_user_api_content, _mark_auto_recall_append
     codex_user_input = compose_user_api_content(
         user_message, ext_prefetch_cache, plugin_user_context,
     ) or user_message
     try:
         _start_codex_thread(agent)
+        if ext_prefetch_cache:
+            _mark_auto_recall_append(agent, codex_user_input)
         turn = agent._codex_session.run_turn(user_input=codex_user_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")

@@ -41,6 +41,8 @@ def populated_db(db):
     db.end_session("s1", end_reason="user_exit")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's1'", (now - 2 * day + 3600,))
     db.update_token_counts("s1", input_tokens=50000, output_tokens=15000)
+    db.update_auto_recall_metrics("s1", failures=0, latency_ms=48000)
+    db.update_auto_recall_metrics("s1", failures=1, latency_ms=60000)
     db.append_message("s1", role="user", content="Hello, help me fix a bug")
     db.append_message("s1", role="assistant", content="Sure, let me look into that.")
     db.append_message("s1", role="assistant", content="Let me search the files.",
@@ -70,6 +72,7 @@ def populated_db(db):
     db.end_session("s2", end_reason="timeout")
     db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 's2'", (now - 5 * day + 1800,))
     db.update_token_counts("s2", input_tokens=20000, output_tokens=8000)
+    db.update_auto_recall_metrics("s2", failures=0, latency_ms=12000)
     db.append_message("s2", role="user", content="Search the web for something")
     db.append_message("s2", role="assistant", content="Searching...",
                       tool_calls=[{"function": {"name": "web_search"}}])
@@ -223,6 +226,14 @@ class TestBarChart:
 # =========================================================================
 
 class TestInsightsEmpty:
+    def test_empty_db_has_zero_recall_metrics(self, db):
+        recall = InsightsEngine(db).generate(days=30)["memory_recall"]
+        assert recall == {
+            "attempts": 0, "successes": 0, "failures": 0,
+            "failure_percentage": 0.0, "total_latency_ms": 0,
+            "min_latency_ms": 0, "avg_latency_ms": 0.0, "max_latency_ms": 0,
+        }
+
     def test_empty_db_returns_empty_report(self, db):
         engine = InsightsEngine(db)
         report = engine.generate(days=30)
@@ -247,6 +258,24 @@ class TestInsightsEmpty:
 # =========================================================================
 
 class TestInsightsPopulated:
+
+    def test_auto_recall_aggregation_and_rendering(self, populated_db):
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30)
+        recall = report["memory_recall"]
+        assert (recall["attempts"], recall["successes"], recall["failures"]) == (3, 2, 1)
+        assert recall["failure_percentage"] == pytest.approx(100 / 3)
+        assert recall["total_latency_ms"] == 120000
+        assert (recall["min_latency_ms"], recall["avg_latency_ms"], recall["max_latency_ms"]) == (12000, 40000, 60000)
+        assert "Auto-Injected Recall" in engine.format_terminal(report)
+        assert "Auto-injected recall" in engine.format_gateway(report)
+
+    def test_auto_recall_respects_days_and_source(self, populated_db):
+        engine = InsightsEngine(populated_db)
+        recent = engine.generate(days=3)["memory_recall"]
+        assert (recent["attempts"], recent["failures"], recent["avg_latency_ms"]) == (2, 1, 54000)
+        telegram = engine.generate(days=30, source="telegram")["memory_recall"]
+        assert (telegram["attempts"], telegram["min_latency_ms"]) == (1, 12000)
 
 
     def test_overview_token_totals(self, populated_db):

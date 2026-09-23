@@ -96,6 +96,26 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
+def _mark_auto_recall_append(agent: Any, sent_content: Any) -> None:
+    """Observe the first provider-bound copy, without modifying its bytes."""
+    observation = getattr(agent, "_last_auto_recall_observation", None)
+    if not isinstance(observation, dict) or observation.get("append_logged"):
+        return
+    context = getattr(agent, "_auto_recall_context", "")
+    block = build_memory_context_block(context) if context else ""
+    appended = bool(block and isinstance(sent_content, str) and block in sent_content)
+    observation["append_logged"] = True
+    observation["memory_context_appended"] = appended
+    if appended:
+        observation["memory_context_chars"] = len(sent_content)
+        logger.info("Auto-recall memory-context appended: session=%s chars=%d",
+                    getattr(agent, "session_id", None) or "", len(sent_content))
+    else:
+        observation["append_failure_reason"] = "build_block_empty"
+        logger.info("Auto-recall memory-context append skipped: session=%s reason=build_block_empty",
+                    getattr(agent, "session_id", None) or "")
+
+
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     """Pop the ``api_content`` sidecar and substitute it into ``content`` (keeps the
     prompt-cache prefix byte-stable). Returns the popped sidecar, or ``None``."""
@@ -834,6 +854,8 @@ def _memory_turn_start_and_prefetch(
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
     Returns the prefetch text (``""`` when nothing was injected)."""
+    agent._last_auto_recall_observation = None
+    agent._auto_recall_context = ""
     if not agent._memory_manager:
         return ""
     # The boundary is queued behind earlier sync writes. Do not tick the provider
@@ -850,9 +872,38 @@ def _memory_turn_start_and_prefetch(
             author_is_bot=bool(_author.get("is_bot")),
         )
     ext_prefetch_cache = ""
-    with suppress(Exception):
-        if not is_trivial_prompt(_query):
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+    if not is_trivial_prompt(_query):
+        started = time.monotonic()
+        recall_error = None
+        try:
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                _query, session_id=agent.session_id,
+            ) or ""
+        except Exception as exc:
+            recall_error = exc
+        latency_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
+        success = bool(ext_prefetch_cache.strip()) and recall_error is None
+        reason = type(recall_error).__name__ if recall_error else ("" if success else "empty_result")
+        agent._last_auto_recall_observation = {
+            "mode": "prefetch", "attempted": True, "success": success,
+            "latency_ms": latency_ms, "context_chars": len(ext_prefetch_cache),
+            "failure_reason": reason,
+        }
+        # Retain only in the current-turn agent state for the append check.
+        if ext_prefetch_cache:
+            agent._auto_recall_context = ext_prefetch_cache
+        session_db = getattr(agent, "_session_db", None)
+        if session_db is not None and getattr(agent, "session_id", None):
+            try:
+                session_db.update_auto_recall_metrics(
+                    agent.session_id, attempts=1, failures=0 if success else 1,
+                    latency_ms=latency_ms,
+                )
+            except Exception as exc:
+                logger.debug("Auto-recall metrics persistence failed (session=%s): %s",
+                             agent.session_id, exc)
+        logger.info("Auto-recall prefetch: session=%s success=%s latency_ms=%d context_chars=%d failure_reason=%s",
+                    agent.session_id or "", success, latency_ms, len(ext_prefetch_cache), reason or "none")
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
@@ -1182,6 +1233,8 @@ def build_api_messages(
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed
+            if ext_prefetch_cache:
+                _mark_auto_recall_append(agent, api_msg.get("content"))
         elif (
             isinstance(_api_content, str) and _api_content
             and msg.get("role") in ("user", "assistant")

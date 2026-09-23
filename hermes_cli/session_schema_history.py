@@ -204,6 +204,14 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
         )),
         ('26 2026-09-02T14:22Z 8e4366d358', (('+', 'tool_names', 'last_read_at'),)),
         ('27 2026-09-19T00:10Z 922a0c3c87', (('+', 'transport_profile', 'profile_name'),)),
+        ('28 2026-09-23T00:52Z local-auto-recall', (
+            ('+', 'auto_recall_attempt_count', 'api_call_count'),
+            ('+', 'auto_recall_success_count', 'auto_recall_attempt_count'),
+            ('+', 'auto_recall_failure_count', 'auto_recall_success_count'),
+            ('+', 'auto_recall_total_latency_ms', 'auto_recall_failure_count'),
+            ('+', 'auto_recall_min_latency_ms', 'auto_recall_total_latency_ms'),
+            ('+', 'auto_recall_max_latency_ms', 'auto_recall_min_latency_ms'),
+        )),
         ),
     ),
     "messages": _TableHistory(
