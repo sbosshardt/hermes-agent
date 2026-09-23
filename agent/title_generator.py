@@ -59,8 +59,10 @@ MAX_DERIVED_TITLE_CHARS = 48
 # legitimate wordy titles while excluding full-sentence answers.
 _MAX_TITLE_WORDS = 12
 _CONVERSATIONAL_OPENER = re.compile(
-    r"^(?:can you|could you|would you|please|i(?:'d| would)? like(?: for you)? to|"
-    r"i need(?: you)? to|let us|let's)\b\s*", re.IGNORECASE,
+    r"^(?:can you|could you|would you(?: mind)?|please|help me|"
+    r"i(?:'d| would)? like(?: (?:for )?you)? to|i want(?: you)? to|i (?:ask|expect) you to|"
+    r"i(?: would|'d) appreciate it if you could|i need(?: you)? to|"
+    r"let us|let's)\b\s*", re.IGNORECASE,
 )
 # Output budget for the title call: room for a fenced/prefixed JSON reply and for a reasoning model that
 # thinks despite the thinking-disabled request, without letting a runaway reply burn minutes.
@@ -373,10 +375,21 @@ def _clean_title(text: str) -> Optional[str]:
     return title or None
 
 
-def _topic_fallback(user_snippet: str) -> Optional[str]:
-    """Use only the first request clause, not an arbitrary later instruction."""
-    first = re.split(r"[.!?](?:\s|$)", user_snippet, maxsplit=1)[0].strip()
-    topic = _CONVERSATIONAL_OPENER.sub("", first).strip(" \"'.,:;!?()[]{}")
+def _topic_fallback(user_message: str) -> Optional[str]:
+    """Use the typed first request clause, never the appended paste preview or a later instruction."""
+    first = _first_line(_summarize_user_message(user_message))
+    first = re.split(r"[.!?](?:\s|$)", first, maxsplit=1)[0].strip()
+    if _ATTACHMENT_REF_RE.sub("", first).strip() == "":
+        return None
+    # "Please can you" has two conversational prefixes; strip both, but do not
+    # continue into a pasted second line or preview to find a replacement topic.
+    topic = first
+    for _ in range(2):
+        stripped = _CONVERSATIONAL_OPENER.sub("", topic).strip()
+        if stripped == topic:
+            break
+        topic = stripped
+    topic = topic.strip(" \"'.,:;!?()[]{}")
     if not topic:
         return None
     return _clean_title(" ".join(topic.split()[:6]))
@@ -487,7 +500,7 @@ def generate_title(
         # Apply this only after extraction and the answer guard: never turn a
         # truncated JSON/fence or a long answer into an apparently valid title.
         if title is not None and _CONVERSATIONAL_OPENER.match(title):
-            title = _topic_fallback(user_snippet)
+            title = _topic_fallback(user_message)
             if title is None:
                 return None
         # Example-echo guard: a title that parrots one of the prompt's own
