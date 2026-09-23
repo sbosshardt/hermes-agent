@@ -410,7 +410,7 @@ def test_codex_start_failure_does_not_claim_recall_was_appended(monkeypatch):
     assert "append_logged" not in agent._last_auto_recall_observation
 
 
-from agent.codex_runtime import run_codex_app_server_turn
+from agent.codex_runtime import _observe_codex_recall_append, run_codex_app_server_turn
 from agent.turn_context import compose_user_api_content
 
 
@@ -509,6 +509,22 @@ def test_user_quoted_exact_recall_block_is_not_fresh_append(monkeypatch):
     quoted = "Question\n\n" + build_memory_context_block("remembered fact")
     agent = _codex_agent(monkeypatch, _turn(submitted_user_text=quoted))
     _run(agent, selected="", user_message=quoted, plugin="")
+    assert agent._last_auto_recall_observation["memory_context_appended"] is False
+
+
+@pytest.mark.parametrize("quoted_block", [False, True])
+def test_direct_acknowledgement_of_clean_input_is_not_proof_of_append(monkeypatch, quoted_block):
+    from agent.memory_manager import build_memory_context_block
+    clean_input = "Question"
+    if quoted_block:
+        clean_input += "\n\n" + build_memory_context_block("remembered fact")
+    agent = _codex_agent(monkeypatch, _turn(submitted_user_text=clean_input))
+    _observe_codex_recall_append(
+        agent, agent._codex_session.run_turn.return_value,
+        selected_recall="remembered fact", composed_input=clean_input,
+        user_message=clean_input, plugin_user_context="",
+        history_seed="", seed_pending=False,
+    )
     assert agent._last_auto_recall_observation["memory_context_appended"] is False
 
 

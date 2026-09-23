@@ -623,6 +623,7 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
 
 
 def _observe_codex_recall_append(agent, turn, *, selected_recall: str, composed_input: str,
+                                 user_message: str, plugin_user_context: str,
                                  history_seed: str, seed_pending: bool) -> None:
     """Best-effort observation of this turn's acknowledged recall suffix, not DB accounting."""
     observation = getattr(agent, "_last_auto_recall_observation", None)
@@ -636,8 +637,12 @@ def _observe_codex_recall_append(agent, turn, *, selected_recall: str, composed_
     from agent.memory_manager import build_memory_context_block
     recall_block = build_memory_context_block(selected_recall) if isinstance(selected_recall, str) else ""
     submitted = getattr(turn, "submitted_user_text", None)
-    expected = ((history_seed + "\n\n[CURRENT USER TURN]\n") if seed_pending and history_seed else "") + composed_input
+    plugin = plugin_user_context if isinstance(plugin_user_context, str) else ""
+    expected_current = (user_message + "\n\n" + recall_block
+                        + ("\n\n" + plugin if plugin else "")) if isinstance(user_message, str) else ""
+    expected = ((history_seed + "\n\n[CURRENT USER TURN]\n") if seed_pending and history_seed else "") + expected_current
     appended = bool(recall_block and selected_recall == context
+                    and composed_input == expected_current
                     and isinstance(submitted, str) and submitted == expected)
     observation["append_logged"] = True
     observation["memory_context_appended"] = appended
@@ -686,6 +691,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         )
     _observe_codex_recall_append(
         agent, turn, selected_recall=ext_prefetch_cache, composed_input=codex_user_input,
+        user_message=user_message, plugin_user_context=plugin_user_context,
         history_seed=history_seed, seed_pending=seed_pending,
     )
     if getattr(turn, "input_accepted", False) and messages and messages[-1].get("role") == "user":
