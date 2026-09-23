@@ -22,7 +22,7 @@ from email.mime.base import MIMEBase
 from email.utils import formatdate
 from email import encoders
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.platforms.base import (
     BasePlatformAdapter, SendResult,
@@ -336,12 +336,16 @@ def _verify_temporary_dkim(
 ) -> Tuple[bool, bool, str]:
     """Re-verify aligned DKIM signatures after a receiving-server temperror.
 
-    Returns ``(authenticated, retryable, reason)``.  A retryable result is
-    deliberately limited to a fresh DNS timeout; malformed signatures and
+    Returns ``(authenticated, retryable, reason)``.  Only fresh DNS timeouts
+    and explicit SERVFAIL responses are retryable; malformed signatures and
     missing/nonmatching keys are terminal failures and are never forwarded.
     """
     try:
         import dkim
+        import dns.exception
+        import dns.rcode
+        import dns.rdatatype
+        import dns.resolver
     except ImportError:
         # This should be impossible for a packaged install, but fail closed and
         # retain the unread message if packaging is accidentally incomplete.
@@ -364,14 +368,36 @@ def _verify_temporary_dkim(
         return False, False, "no DKIM-Signature header"
 
     dns_timed_out = False
+    dns_servfail = False
 
     def dnsfunc(name: bytes, timeout: int = 5) -> bytes | None:
-        nonlocal dns_timed_out
+        nonlocal dns_timed_out, dns_servfail
         try:
-            return cast(bytes | None, dkim.get_txt(name, timeout=timeout))
-        except dkim.DnsTimeoutError:
+            answer = dns.resolver.resolve(
+                name.decode("utf-8"), dns.rdatatype.TXT,
+                raise_on_no_answer=False, lifetime=timeout, search=True,
+            )
+            for rrset in answer.response.answer:
+                if rrset.rdtype == dns.rdatatype.TXT:
+                    return b"".join(list(rrset.items)[0].strings)
+        except (dns.resolver.NXDOMAIN, UnicodeDecodeError):
+            pass
+        except dns.resolver.NoNameservers as exc:
+            # dkimpy's get_txt_dnspython swallows *all* NoNameservers,
+            # including SERVFAIL. Do not treat REFUSED/FORMERR or mixed
+            # failures as transient: require an actual SERVFAIL response
+            # from every attempted nameserver.
+            errors = exc.kwargs.get("errors", [])
+            if errors and all(
+                len(error) >= 5 and error[4] is not None
+                and error[4].rcode() == dns.rcode.SERVFAIL
+                for error in errors
+            ):
+                dns_servfail = True
+        except (dns.resolver.NoResolverConfiguration, dns.exception.Timeout):
             dns_timed_out = True
-            raise
+            raise dkim.DnsTimeoutError("DNS resolver unavailable or timed out")
+        return None
 
     for index in range(signature_count):
         try:
@@ -403,6 +429,8 @@ def _verify_temporary_dkim(
 
     if dns_timed_out:
         return False, True, "DKIM DNS lookup timed out"
+    if dns_servfail:
+        return False, True, "DKIM DNS SERVFAIL"
     return False, False, "DKIM re-verification failed"
 
 def _extract_attachments(msg: email_lib.message.Message, skip_attachments: bool = False) -> List[Dict[str, Any]]:

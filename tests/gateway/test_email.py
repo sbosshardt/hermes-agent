@@ -1351,8 +1351,12 @@ class TestTemporaryAuthenticationRetry(unittest.TestCase):
             include_headers=[b"from", b"to", b"subject"],
         ) + original
         key_record = b"v=DKIM1; k=rsa; p=" + base64.b64encode(public_der)
+        import dns.rdatatype
+        txt_rrset = MagicMock(rdtype=dns.rdatatype.TXT, items=[MagicMock(strings=[key_record])])
+        dns_answer = MagicMock()
+        dns_answer.response.answer = [txt_rrset]
 
-        with patch("dkim.get_txt", return_value=key_record):
+        with patch("dns.resolver.resolve", return_value=dns_answer):
             verified, retryable, reason = _verify_temporary_dkim(
                 signed, "admin@example.com"
             )
@@ -1363,7 +1367,7 @@ class TestTemporaryAuthenticationRetry(unittest.TestCase):
 
         # Authentication must be over the fetched wire bytes, not the parsed
         # or reserialized message: even one modified body byte invalidates it.
-        with patch("dkim.get_txt", return_value=key_record):
+        with patch("dns.resolver.resolve", return_value=dns_answer):
             verified, retryable, _reason = _verify_temporary_dkim(
                 signed.replace(b"Hello\r\n", b"Tampered\r\n"), "admin@example.com"
             )
@@ -1372,20 +1376,73 @@ class TestTemporaryAuthenticationRetry(unittest.TestCase):
 
         # A cryptographically valid signature for another From domain is not
         # evidence that the allowlisted sender is authenticated.
-        with patch("dkim.get_txt", return_value=key_record):
+        with patch("dns.resolver.resolve", return_value=dns_answer) as resolve:
             verified, retryable, _reason = _verify_temporary_dkim(
                 signed, "admin@unrelated.test"
             )
+            resolve.assert_not_called()
         self.assertFalse(verified)
         self.assertFalse(retryable)
 
-        with patch("dkim.get_txt", side_effect=dkim.DnsTimeoutError("DNS timeout")):
+        import dns.exception
+        with patch("dns.resolver.resolve", side_effect=dns.exception.Timeout("DNS timeout")):
             verified, retryable, reason = _verify_temporary_dkim(
                 signed, "admin@example.com"
             )
         self.assertFalse(verified)
         self.assertTrue(retryable)
         self.assertIn("DNS", reason)
+
+        # dkimpy 1.1.8 silently maps dns.resolver.NoNameservers (including
+        # SERVFAIL) to a missing key; only a definitive SERVFAIL response is
+        # transient. Other DNS failures must not become retryable.
+        import dns.message
+        import dns.rcode
+        import dns.resolver
+        request = dns.message.make_query("retry._domainkey.example.com.", "TXT")
+        for rcodes, expected_retry in (
+            ((dns.rcode.SERVFAIL,), True),
+            ((dns.rcode.REFUSED,), False),
+            ((dns.rcode.SERVFAIL, dns.rcode.REFUSED), False),
+        ):
+            with self.subTest(rcodes=[dns.rcode.to_text(code) for code in rcodes]):
+                errors = []
+                for code in rcodes:
+                    response = dns.message.make_response(request)
+                    response.set_rcode(code)
+                    errors.append(("nameserver", False, 53, dns.rcode.to_text(code), response))
+                error = dns.resolver.NoNameservers(request=request, errors=errors)
+                with patch("dns.resolver.resolve", side_effect=error):
+                    verified, retryable, _reason = _verify_temporary_dkim(
+                        signed, "admin@example.com"
+                    )
+                self.assertFalse(verified)
+                self.assertEqual(retryable, expected_retry)
+
+        # SERVFAIL cannot turn an unsigned or misaligned message into a retry.
+        servfail_response = dns.message.make_response(request)
+        servfail_response.set_rcode(dns.rcode.SERVFAIL)
+        servfail = dns.resolver.NoNameservers(
+            request=request,
+            errors=[("nameserver", False, 53, "SERVFAIL", servfail_response)],
+        )
+        with patch("dns.resolver.resolve", side_effect=servfail) as resolve:
+            self.assertEqual(
+                _verify_temporary_dkim(original, "admin@example.com")[:2],
+                (False, False),
+            )
+            self.assertEqual(
+                _verify_temporary_dkim(signed, "admin@unrelated.test")[:2],
+                (False, False),
+            )
+            resolve.assert_not_called()
+
+        with patch("dns.resolver.resolve", side_effect=dns.resolver.NXDOMAIN()):
+            verified, retryable, _reason = _verify_temporary_dkim(
+                signed, "admin@example.com"
+            )
+        self.assertFalse(verified)
+        self.assertFalse(retryable)
 
     def test_persisted_retry_reauthenticates_and_dispatches_at_most_once(self):
         """A fresh adapter resumes the queued UID, then acknowledges before dispatch."""
