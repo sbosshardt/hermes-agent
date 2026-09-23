@@ -65,7 +65,7 @@ def _known_recall_text(content: Any) -> Any:
 
 
 def _selected_recall_position(agent: Any, api_messages: Any) -> tuple[Any, Any]:
-    """Take the provenance marker off selected rows before constructing provider kwargs.
+    """Find the uniquely marked current row before constructing provider kwargs.
 
     Context selection and request assembly may replace rows. Only a surviving current
     user row with the freshly composed content (allowing the request's `.strip()` pass)
@@ -81,7 +81,7 @@ def _selected_recall_position(agent: Any, api_messages: Any) -> tuple[Any, Any]:
     for index, row in enumerate(api_messages):
         if not isinstance(row, dict):
             continue
-        marker = row.pop(_AUTO_RECALL_CURRENT_KEY, None)
+        marker = row.get(_AUTO_RECALL_CURRENT_KEY)
         if (isinstance(provenance, tuple) and len(provenance) == 2
                 and marker == provenance[0]):
             if position is not None:  # duplicate marker: no unique current turn
@@ -99,21 +99,26 @@ def _selected_recall_position(agent: Any, api_messages: Any) -> tuple[Any, Any]:
 
 def _observe_chat_recall_request(
     agent: Any, api_kwargs: Any, position: Any, expected: Any,
-    original_row: Any, ambiguous_history: bool,
 ) -> None:
     """Record assembled provider-bound bytes, not provider acceptance or consumption."""
     observation = getattr(agent, "_last_auto_recall_observation", None)
     if not isinstance(observation, dict) or observation.get("append_logged"):
         return
     rows = api_kwargs.get("messages") if isinstance(api_kwargs, dict) else None
+    from agent.turn_context import _AUTO_RECALL_CURRENT_KEY
+
+    provenance = getattr(agent, "_chat_auto_recall_provenance", None)
     row = rows[position] if (isinstance(rows, list) and isinstance(position, int)
                              and 0 <= position < len(rows)) else None
-    appended = bool(isinstance(row, dict) and row.get("role") == "user"
+    appended = bool(isinstance(rows, list) and isinstance(row, dict)
+                    and row.get("role") == "user"
                     and isinstance(expected, str)
                     and _known_recall_text(row.get("content")) == expected
-                    # If a historical row has identical bytes, a copied/replaced row at
-                    # this coordinate cannot prove that the live turn survived middleware.
-                    and (not ambiguous_history or row is original_row))
+                    and isinstance(provenance, tuple) and len(provenance) == 2
+                    and row.get(_AUTO_RECALL_CURRENT_KEY) == provenance[0]
+                    and sum(isinstance(item, dict)
+                            and item.get(_AUTO_RECALL_CURRENT_KEY) == provenance[0]
+                            for item in rows) == 1)
     observation["append_logged"] = True
     observation["append_stage"] = "assembled_provider_bound"
     observation["memory_context_appended"] = appended
@@ -125,6 +130,24 @@ def _observe_chat_recall_request(
         observation["append_failure_reason"] = "not_in_final_current_user"
         logger.info("Auto-recall memory-context not in final current user request: session=%s",
                     getattr(agent, "session_id", None) or "")
+
+
+def _strip_recall_provenance(*payloads: Any) -> None:
+    """Remove request-local evidence from every retained and provider-bound message copy."""
+    from agent.turn_context import _AUTO_RECALL_CURRENT_KEY
+
+    for payload in payloads:
+        if isinstance(payload, list):
+            lists = (payload,)
+        elif isinstance(payload, dict):
+            lists = (payload.get("messages"), payload.get("input"))
+        else:
+            continue
+        for rows in lists:
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        row.pop(_AUTO_RECALL_CURRENT_KEY, None)
 
 
 def _fire_pre_api_request_hook(
@@ -226,18 +249,6 @@ def build_api_request(
     if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
         _set_extra_header(api_kwargs, "x-initiator", "user")
         agent._is_user_initiated_turn = False
-    pre_middleware_rows = api_kwargs.get("messages") if isinstance(api_kwargs, dict) else None
-    pre_middleware_row = (
-        pre_middleware_rows[recall_position]
-        if isinstance(pre_middleware_rows, list) and isinstance(recall_position, int)
-        and 0 <= recall_position < len(pre_middleware_rows) else None
-    )
-    ambiguous_history = bool(
-        isinstance(pre_middleware_rows, list) and isinstance(recall_expected, str)
-        and any(i != recall_position and isinstance(row, dict)
-                and _known_recall_text(row.get("content")) == recall_expected
-                for i, row in enumerate(pre_middleware_rows))
-    )
     try:
         from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -253,6 +264,10 @@ def build_api_request(
     except Exception:
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
+
+    if agent.api_mode == "chat_completions" and getattr(agent, "_auto_recall_context", ""):
+        _observe_chat_recall_request(agent, api_kwargs, recall_position, recall_expected)
+    _strip_recall_provenance(api_kwargs, _original_api_kwargs, api_messages)
 
     _fire_pre_api_request_hook(
         agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,
@@ -278,9 +293,6 @@ def build_api_request(
                 "prepared prompt without the MoA handshake",
                 type(agent.client).__name__,
             )
-    if agent.api_mode == "chat_completions" and getattr(agent, "_auto_recall_context", ""):
-        _observe_chat_recall_request(agent, api_kwargs, recall_position, recall_expected,
-                                     pre_middleware_row, ambiguous_history)
     return ApiRequestBuild(
         "fallthrough", api_messages, _moa_prepared_request, tools_for_api, api_kwargs,
         _original_api_kwargs, _llm_middleware_trace,

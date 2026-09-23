@@ -29,7 +29,8 @@ from agent.turn_author import parse_turn_author
 
 logger = logging.getLogger(__name__)
 
-# Request-local provenance only. Removed before _build_api_kwargs; never a provider field.
+# Request-local provenance only. Carried through request middleware, then stripped
+# from all request copies before hooks, debug dumps and provider execution.
 _AUTO_RECALL_CURRENT_KEY = "_auto_recall_current_turn_provenance"
 
 

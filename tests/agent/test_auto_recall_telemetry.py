@@ -56,7 +56,8 @@ def test_prefetch_metric_write_failure_is_reported_without_leaking_context(caplo
 
 
 def _chat_observation_request(monkeypatch, *, user_text="Question", select=None, middleware=None,
-                              history_text=None, prefetch="remembered fact"):
+                              history_text=None, prefetch="remembered fact", real_middleware=False,
+                              inspect_request=None):
     """Exercise the real composition, selection hook and final request assembly without I/O."""
     from agent.turn_context import build_api_messages
     from agent.conversation_loop import _apply_context_engine_selection
@@ -91,11 +92,22 @@ def _chat_observation_request(monkeypatch, *, user_text="Question", select=None,
         monkeypatch.setattr("agent.conversation_loop._engine_overrides_hook", lambda *args: True)
     monkeypatch.setattr("agent.conversation_loop._redecorate_prompt_cache_for_provider",
                         lambda agent, msgs, **kwargs: (msgs, None, []))
-    monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware",
-                        lambda payload, **kwargs: SimpleNamespace(
-                            payload=middleware(payload) if middleware else payload,
-                            original_payload=payload, trace=[]))
-    monkeypatch.setattr("agent.turn_api_request._fire_pre_api_request_hook", lambda *a, **k: None)
+    if real_middleware:
+        assert middleware is not None
+        monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda kind: True)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware",
+                            lambda kind, **context: [{"request": middleware(**context)}])
+    else:
+        monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware",
+                            lambda payload, **kwargs: SimpleNamespace(
+                                payload=middleware(payload) if middleware else payload,
+                                original_payload=payload, trace=[]))
+    monkeypatch.setattr("agent.turn_api_request._fire_pre_api_request_hook",
+                        lambda agent, api_kwargs, api_messages, *a, **k:
+                        inspect_request(api_kwargs, api_messages) if inspect_request else None)
+    if inspect_request:
+        monkeypatch.setattr("agent.turn_api_request.env_var_enabled", lambda key: True)
+        agent._dump_api_request_debug = lambda kwargs, **kw: inspect_request(kwargs, api_messages)
     monkeypatch.setattr("agent.turn_api_request.strip_images_for_rejecting_model", lambda *a: None)
 
     history = {"role": "user", "content": history_text if history_text is not None else
@@ -118,6 +130,8 @@ def _chat_observation_request(monkeypatch, *, user_text="Question", select=None,
     assert all("_auto_recall_current_turn_provenance" not in row for row in rows)
     assert all("_auto_recall_current_turn_provenance" not in row
                for row in result.api_kwargs["messages"])
+    if inspect_request:
+        inspect_request(result._original_api_kwargs, result.api_messages)
     return agent._last_auto_recall_observation, result.api_kwargs
 
 
@@ -209,6 +223,86 @@ def test_chat_observation_allows_known_cache_text_part_normalization(monkeypatch
 
     observation, _ = _chat_observation_request(monkeypatch, middleware=cache_parts)
     assert observation["memory_context_appended"] is True
+
+
+def test_chat_observation_real_middleware_replacement_after_normalization_fails_closed(monkeypatch):
+    """A copied historical row must not become a current turn just by matching text."""
+    from agent.turn_context import _AUTO_RECALL_CURRENT_KEY, compose_user_api_content
+
+    expected = compose_user_api_content("Question", "remembered fact", "")
+    assert expected is not None
+
+    def replace_with_normalized_history(**kwargs):
+        rows = kwargs["request"]["messages"]
+        assert rows[-2]["content"] != rows[-1]["content"]
+        historical = {**rows[-2], "content": rows[-2]["content"].strip()}
+        assert historical["content"] == rows[-1]["content"]
+        return {**kwargs["request"], "messages": [*rows[:-1], historical],
+                "test_replaced": True}
+
+    def inspect(payload, api_messages):
+        assert all(_AUTO_RECALL_CURRENT_KEY not in row for row in payload["messages"])
+        assert all(_AUTO_RECALL_CURRENT_KEY not in row for row in api_messages)
+
+    observation, kwargs = _chat_observation_request(
+        monkeypatch, history_text=expected + "  ", middleware=replace_with_normalized_history,
+        real_middleware=True, inspect_request=inspect,
+    )
+    assert kwargs["test_replaced"] is True  # real chain returned its replacement
+    assert kwargs["messages"][-1]["content"] == expected
+    assert observation["memory_context_appended"] is False
+
+
+def test_chat_observation_real_middleware_normalized_current_and_all_copies_clean(monkeypatch):
+    from agent.turn_context import _AUTO_RECALL_CURRENT_KEY
+
+    inspections = []
+
+    def inspect(payload, api_messages):
+        assert all(_AUTO_RECALL_CURRENT_KEY not in row for row in payload["messages"])
+        assert all(_AUTO_RECALL_CURRENT_KEY not in row for row in api_messages)
+        inspections.append(True)
+
+    def normalize(**kwargs):
+        rows = list(kwargs["request"]["messages"])
+        assert _AUTO_RECALL_CURRENT_KEY in rows[-1]  # proof crossed the real middleware copy
+        rows[-1] = {**rows[-1], "content": [
+            {"type": "text", "text": rows[-1]["content"],
+             "cache_control": {"type": "ephemeral"}},
+        ]}
+        return {**kwargs["request"], "messages": rows}
+
+    observation, _ = _chat_observation_request(
+        monkeypatch, middleware=normalize, real_middleware=True, inspect_request=inspect,
+    )
+    assert observation["memory_context_appended"] is True
+    assert len(inspections) == 3  # hook, debug dump, returned original payload
+
+
+def test_chat_observation_real_middleware_duplicate_current_marker_fails_closed(monkeypatch):
+    def duplicate(**kwargs):
+        rows = kwargs["request"]["messages"]
+        return {**kwargs["request"], "messages": [*rows, {**rows[-1]}]}
+
+    observation, _ = _chat_observation_request(
+        monkeypatch, middleware=duplicate, real_middleware=True,
+    )
+    assert observation["memory_context_appended"] is False
+
+
+def test_chat_observation_real_middleware_lost_marker_fails_closed(monkeypatch):
+    from agent.turn_context import _AUTO_RECALL_CURRENT_KEY
+
+    def lose_marker(**kwargs):
+        rows = list(kwargs["request"]["messages"])
+        rows[-1] = {key: value for key, value in rows[-1].items()
+                    if key != _AUTO_RECALL_CURRENT_KEY}
+        return {**kwargs["request"], "messages": rows}
+
+    observation, _ = _chat_observation_request(
+        monkeypatch, middleware=lose_marker, real_middleware=True,
+    )
+    assert observation["memory_context_appended"] is False
 
 
 @pytest.mark.parametrize("query,boundary", [("hello", True), ("What did we decide?", False)])
