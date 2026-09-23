@@ -29,6 +29,9 @@ from agent.turn_author import parse_turn_author
 
 logger = logging.getLogger(__name__)
 
+# Request-local provenance only. Removed before _build_api_kwargs; never a provider field.
+_AUTO_RECALL_CURRENT_KEY = "_auto_recall_current_turn_provenance"
+
 
 def _str_attr(agent: Any, name: str) -> str:
     """``getattr(agent, name, "") or ""`` — route facts read off partial agents/doubles."""
@@ -899,9 +902,10 @@ def _memory_turn_start_and_prefetch(
                     agent.session_id, attempts=1, failures=0 if success else 1,
                     latency_ms=latency_ms,
                 )
-            except Exception as exc:
-                logger.warning("Auto-recall metrics persistence failed (session=%s): %s",
-                               agent.session_id, exc)
+            except Exception:
+                # DB exceptions may include SQL parameters or provider text.
+                logger.warning("Auto-recall metrics persistence failed (session=%s)",
+                               agent.session_id)
         logger.info("Auto-recall prefetch: session=%s success=%s latency_ms=%d context_chars=%d failure_reason=%s",
                     agent.session_id or "", success, latency_ms, len(ext_prefetch_cache), reason or "none")
     # Deterministic recall indicator via _emit_status so the model can't silently
@@ -1206,6 +1210,10 @@ def build_api_messages(
     split = current_turn_user_idx if has_current else 0
     canonical_messages = canonicalize_replay_history(messages[:split], now=turn_now) + messages[split:]
 
+    # A fresh, opaque marker links this turn's composed row through context selection.
+    # An identical quote in prior history cannot stand in for the live row. Never
+    # infer provenance by searching provider messages for memory-context substrings.
+    agent._chat_auto_recall_provenance = None
     api_messages = []
     for idx, msg in enumerate(canonical_messages):
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
@@ -1233,8 +1241,16 @@ def build_api_messages(
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed
-            if ext_prefetch_cache:
-                _mark_auto_recall_append(agent, api_msg.get("content"))
+            if (ext_prefetch_cache
+                    and ext_prefetch_cache == getattr(agent, "_auto_recall_context", None)
+                    and getattr(agent, "api_mode", None) == "chat_completions"):
+                expected = compose_user_api_content(
+                    msg.get("content"), ext_prefetch_cache, plugin_user_context
+                )
+                if expected is not None:
+                    marker = uuid.uuid4().hex
+                    api_msg[_AUTO_RECALL_CURRENT_KEY] = marker
+                    agent._chat_auto_recall_provenance = (marker, expected)
         elif (
             isinstance(_api_content, str) and _api_content
             and msg.get("role") in ("user", "assistant")
