@@ -77,14 +77,15 @@ def _override_replaces_content(msg: Dict, content: Any, override: Any) -> bool:
     )
 
 
-def durable_user_row_content(agent, msg: Dict, content: Any, api_content: Any) -> Tuple[Any, Any]:
+def durable_user_row_content(agent, msg: Dict, content: Any, api_content: Any, *,
+                             infer_api_content: bool = True) -> Tuple[Any, Any]:
     """``(content, api_content)`` as the current turn's user row is written: the persist override is the
-    clean transcript, the live content is what the wire sent — so when they differ and nothing else was
-    injected, the live bytes ARE the sidecar. Shared by the flush and the turn-start stamp so the stamp
-    matches the row the flush wrote."""
+    clean transcript; for non-Codex turns, differing live content implies the wire sidecar.
+    Codex flushes must instead use only the sidecar stamped after turn/start ACK.
+    Shared by the flush and the turn-start stamp so the stamp matches the row the flush wrote."""
     override = getattr(agent, "_persist_user_message_override", None)
     if _override_replaces_content(msg, content, override):
-        if api_content is None and isinstance(content, str) and content != override:
+        if infer_api_content and api_content is None and isinstance(content, str) and content != override:
             api_content = content
         content = override
     return content, api_content
@@ -194,13 +195,15 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
     timestamp = msg.get("timestamp")
-    # Codex has not sent this current turn until turn/start acknowledges it. Neither the
-    # clean-transcript override nor sanitize-divergence can infer an unsent wire payload.
-    pending_codex_user = (is_current_turn_user and role == "user"
-                          and getattr(agent, "api_mode", None) == "codex_app_server"
-                          and not msg.get("_codex_input_accepted"))
+    # Only turn/start ACK can establish the current Codex user's wire payload;
+    # sanitize-divergence cannot infer it either before or after the ACK.
+    current_codex_user = (is_current_turn_user and role == "user"
+                          and getattr(agent, "api_mode", None) == "codex_app_server")
+    pending_codex_user = current_codex_user and not msg.get("_codex_input_accepted")
     if is_current_turn_user and role == "user":
-        content, api_content = durable_user_row_content(agent, msg, content, api_content)
+        content, api_content = durable_user_row_content(
+            agent, msg, content, api_content, infer_api_content=not current_codex_user,
+        )
         ov_timestamp = getattr(agent, "_persist_user_message_timestamp", None)
         timestamp = timestamp if ov_timestamp is None else ov_timestamp
     if pending_codex_user:
@@ -223,9 +226,10 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         if not preserve_acked_codex_wire:
             api_content = None
     # get_messages_as_conversation replays rows through sanitize_context().strip(); capture the sent bytes
-    # when they would differ (compared in wire form).
+    # when they would differ (compared in wire form). The current Codex user is exempt:
+    # its only authority for a wire sidecar is the acknowledged turn/start stamp.
     if (
-        not pending_codex_user and api_content is None and role in ("user", "assistant") and isinstance(content, str) and content
+        not current_codex_user and api_content is None and role in ("user", "assistant") and isinstance(content, str) and content
         and sanitize_context(content).strip() != content.strip()
     ):
         api_content = content

@@ -407,6 +407,90 @@ def test_codex_late_first_flush_preserves_acknowledged_raw_wire(tmp_path, monkey
         db.close()
 
 
+@pytest.mark.parametrize("persist_override", [None, "question"])
+def test_codex_late_first_flush_clean_retry_does_not_infer_raw_wire(tmp_path, monkeypatch, persist_override):
+    """A failed first INSERT must not make unaccepted raw content a replay sidecar."""
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, render_history_seed
+    from agent.memory_manager import sanitize_context
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-late-clean-retry"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        agent = AIAgent(api_key="test-key", base_url="https://stub.invalid",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        session_db=db, session_id=sid)
+        agent.api_mode = "codex_app_server"
+        agent._session_db_created = True
+        agent._persist_user_message_idx = 0
+        agent._persist_user_message_override = persist_override
+        agent._codex_session = MagicMock()
+        raw = "question <memory-context>literal tag</memory-context>"
+        accepted = "question"
+        assert sanitize_context(raw).strip() == accepted
+        row = {"role": "user", "content": raw}
+        messages = [row]
+        insert = db.append_messages_batch
+
+        def fail_initial_insert(*args, **kwargs):
+            raise OSError("simulated turn-start INSERT failure")
+
+        monkeypatch.setattr(db, "append_messages_batch", fail_initial_insert)
+        agent._flush_messages_to_session_db(messages, None)
+        monkeypatch.setattr(db, "append_messages_batch", insert)
+        assert db.get_messages(sid) == []
+        assert row.get("_row_id") is None
+
+        turn = _make_turn()
+        turn.input_accepted = True
+        agent._codex_session.run_turn.return_value = turn
+        result = run_codex_app_server_turn(agent, user_message=accepted,
+                                            original_user_message=raw, messages=messages,
+                                            effective_task_id="task")
+        assert result["completed"] is True
+        assert agent._codex_session.run_turn.call_args.kwargs["user_input"] == accepted
+        stored = [r for r in db.get_messages(sid) if r["role"] == "user"]
+        assert len(stored) == 1
+        assert stored[0]["content"] == (persist_override or raw)
+        assert stored[0]["api_content"] is None
+        assert SIDECAR_PROVENANCE_KEY not in (stored[0]["display_metadata"] or {})
+        loaded = db.get_messages_as_conversation(sid)[0]
+        assert loaded["content"] == accepted
+        assert loaded.get("api_content") is None
+        seed = render_history_seed([loaded, {"role": "assistant", "content": "ok"},
+                                    {"role": "user", "content": "next"}])
+        assert "[WIRE INPUT SENT WITH THIS PRIOR TURN" not in seed
+        assert raw not in seed
+    finally:
+        db.close()
+
+
+def test_codex_noncurrent_rows_keep_sanitize_divergence_sidecars(tmp_path):
+    """The ACK-only rule is limited to the current Codex user, not history."""
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        sid = "codex-historical-sidecars"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        agent = AIAgent(api_key="test-key", base_url="https://stub.invalid",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        session_db=db, session_id=sid)
+        agent.api_mode = "codex_app_server"
+        agent._session_db_created = True
+        agent._persist_user_message_idx = 2
+        prior_user = "prior <memory-context>old</memory-context>"
+        prior_assistant = "reply <memory-context>old</memory-context>"
+        rows = [{"role": "user", "content": prior_user},
+                {"role": "assistant", "content": prior_assistant},
+                {"role": "user", "content": "current"}]
+        agent._flush_messages_to_session_db(rows, None)
+        stored = db.get_messages(sid)
+        assert [r["api_content"] for r in stored] == [prior_user, prior_assistant, None]
+        loaded = db.get_messages_as_conversation(sid)
+        assert [r.get("api_content") for r in loaded] == [prior_user, prior_assistant, None]
+    finally:
+        db.close()
+
+
 def test_codex_history_seed_rejects_provenance_after_raw_content_collision(tmp_path):
     from agent.codex_runtime_history_seed import render_history_seed
 
