@@ -5,7 +5,7 @@
 - **Release candidate:** `v2026.9.21` / Hermes Agent `v0.21.4`, in an isolated worktree; not deployed or pushed as of this record.
 - **Maintained branch:** `execreations`, still `419ef2a84d` on the previous release. Its fork branch is synchronized at that SHA; new candidate ancestry does not fast-forward from it.
 - **Policy:** use upstream *stable tags*, port only still-needed behavior, validate with rollback in hand, then cut over serially. Movement on `origin/main` alone is not a new stable release.
-- **GitHub authorization:** no issue, PR, comment, branch push, or history rewrite is authorized by this candidate work. After the candidate passes, ask explicitly before a `--force-with-lease` update of `sbosshardt/execreations`, with a fresh remote-SHA lease check. Do not interpret the approval to resume local update work as approval for GitHub writes.
+- **GitHub authorization:** Samuel approved a guarded `--force-with-lease` update of `sbosshardt/execreations` **only after** all candidate validation and rollback gates pass, using a freshly re-read exact remote SHA. That approval does not authorize a public issue, PR, comment, or unrelated branch push; none has occurred.
 
 ## Candidate upstream contributions (proposals, not submissions)
 
@@ -14,8 +14,8 @@
 | Title quality | Small independent PR against current upstream main. | Reject response-shaped/greeting titles and retain concise typed-topic fallback. |
 | Memory framing | Independent prompt-injection-hardening PR. | Recalled material remains informational, including alternate transports. |
 | Prefetch scheduling and session fence | Split into independent executor-starvation and join/session-boundary PRs if call sites remain separable. | No `sync_all()` starvation; bounded joins; no late or stale session publication; no turn-start inline leak. |
-| Auto-recall state/Insights telemetry (pending candidate fix) | State/Insights PR only after local spec review passes. | Additive schema; durable per-session attempt/success/failure/latency and actual provider-bound append; read-only legacy Insights compatibility; best-effort bounded write. |
-| Codex app-server context parity and recovery | Focused transport PR (may split API-content parity from thread-recovery continuity). | API-only injected memory/plugin context, original stored user text, actual sent context available for fresh thread recovery. |
+| Auto-recall state/Insights telemetry (candidate storage fix landed; append review pending) | State/Insights PR only after local append-observation correction and final review pass. | Additive schema; durable per-session attempt/success/failure/latency, read-only legacy Insights compatibility, best-effort bounded write. Observe actual final provider-bound assembly or Codex accepted turn, not a quoted memory block in an early copy; distinguish assembly from provider acceptance. |
+| Codex app-server context parity and recovery (security repair pending) | Focused transport PR (may split API-content parity from thread-recovery continuity). | API-only injected memory/plugin context, original stored user text, lower-trust historical recovery (never developer instructions), sidecars only for acknowledged wire input with durable provenance, including clean overrides/compaction. |
 | Embedded Hindsight launcher | Small provider-runtime PR. | `hindsight-embed` lightweight `uvx` wrapper works without heavy host imports and without ambient base-URL credential leakage. |
 | Email aligned DKIM `temperror` retry | Security-focused PR with an explicit trust-boundary review. | Trusted sender and aligned auth only; retry transient DNS errors, durable mailbox/profile-scoped state across reconnect/restart, ack before dispatch, `dkimpy` packaging, no untrusted dispatch. |
 
