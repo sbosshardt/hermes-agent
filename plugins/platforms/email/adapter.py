@@ -2,6 +2,7 @@
 receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in config.yaml (see website docs)."""
 
 import asyncio
+from contextvars import copy_context
 import email as email_lib
 import hashlib
 import json
@@ -653,6 +654,7 @@ class EmailAdapter(BasePlatformAdapter):
                 self._auth_retry_guard_path,
                 {"version": 1, "mailbox": identity, "generation": generation},
                 mode=0o600,
+                fsync_dir=True,
             )
             atomic_json_write(
                 self._auth_retry_state_path,
@@ -666,6 +668,7 @@ class EmailAdapter(BasePlatformAdapter):
                     ],
                 },
                 mode=0o600,
+                fsync_dir=True,
             )
             self._auth_retry_generation = generation
             return True
@@ -858,7 +861,11 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def _check_inbox(self) -> None:
         """Check INBOX for unseen messages and dispatch them."""
-        messages = await asyncio.get_running_loop().run_in_executor(None, self._fetch_new_messages)
+        # The worker needs the poll task's profile secret and Hermes-home scopes;
+        # run_in_executor does not propagate contextvars on its own.
+        messages = await asyncio.get_running_loop().run_in_executor(
+            None, copy_context().run, self._fetch_new_messages
+        )
         # Dispatch partial results BEFORE escalating a failure — a mid-batch exception returns what was fetched (already marked seen).
         for msg_data in messages:
             await self._dispatch_message(msg_data)

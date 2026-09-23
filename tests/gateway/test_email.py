@@ -1213,6 +1213,7 @@ class TestTemporaryAuthenticationRetry(unittest.TestCase):
 
     def test_temporary_dkim_failure_stays_unseen_and_persists_for_retry(self):
         """A trusted aligned DKIM temperror is not dispatched or silently lost."""
+        from plugins.platforms.email import adapter as email_adapter
         imap = self._imap_for(self._temporary_dkim_message())
         with tempfile.TemporaryDirectory() as home, \
              patch.dict(os.environ, {
@@ -1225,6 +1226,7 @@ class TestTemporaryAuthenticationRetry(unittest.TestCase):
              }, clear=False), \
              patch("plugins.platforms.email.adapter.get_hermes_home", return_value=Path(home), create=True), \
              patch("imaplib.IMAP4_SSL", return_value=imap), \
+             patch.object(email_adapter, "atomic_json_write", wraps=email_adapter.atomic_json_write) as writes, \
              patch(
                  "plugins.platforms.email.adapter._verify_temporary_dkim",
                  return_value=(False, True, "DKIM DNS lookup timed out"),
@@ -1237,6 +1239,8 @@ class TestTemporaryAuthenticationRetry(unittest.TestCase):
                 state = json.load(handle)
             with adapter._auth_retry_guard_path.open(encoding="utf-8") as handle:
                 guard = json.load(handle)
+            self.assertGreaterEqual(writes.call_count, 4)  # bootstrap and retained UID, two records each
+            self.assertTrue(all(call.kwargs.get("fsync_dir") is True for call in writes.call_args_list))
 
         self.assertEqual(results, [])
         self.assertTrue(any(
@@ -1252,6 +1256,67 @@ class TestTemporaryAuthenticationRetry(unittest.TestCase):
         self.assertEqual(state["pending"], ["7"])
         self.assertEqual(state["generation"], guard["generation"])
         self.assertGreater(state["generation"], 0)
+
+    def test_executor_poll_uses_own_profile_allowlist_after_a_b_a_switch(self):
+        """Secondary profile retains a temporary DKIM failure despite A's allow-all."""
+        from agent import secret_scope as ss
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        raw = self._temporary_dkim_message()
+        ss.set_multiplex_active(True)
+        self.addCleanup(ss.set_multiplex_active, False)
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "HERMES_HOME": root,
+            "EMAIL_ADDRESS": "default@test.invalid",
+            "EMAIL_PASSWORD": "default-password",
+            "EMAIL_IMAP_HOST": "imap.default.invalid",
+            "EMAIL_SMTP_HOST": "smtp.default.invalid",
+            "EMAIL_ALLOW_ALL_USERS": "true",
+            "EMAIL_ALLOWED_USERS": "",
+        }, clear=False), patch(
+            "plugins.platforms.email.adapter._verify_temporary_dkim",
+            return_value=(False, True, "DKIM DNS lookup timed out"),
+        ) as verify:
+            for label, secrets in (
+                ("A", {
+                    "EMAIL_ADDRESS": "default@test.invalid", "EMAIL_PASSWORD": "default-password",
+                    "EMAIL_IMAP_HOST": "imap.default.invalid", "EMAIL_SMTP_HOST": "smtp.default.invalid",
+                    "EMAIL_ALLOW_ALL_USERS": "true",
+                }),
+                ("B", {
+                    "EMAIL_ADDRESS": "secondary@test.invalid", "EMAIL_PASSWORD": "secondary-password",
+                    "EMAIL_IMAP_HOST": "imap.secondary.invalid", "EMAIL_SMTP_HOST": "smtp.secondary.invalid",
+                    "EMAIL_ALLOWED_USERS": "admin@example.com",
+                }),
+                ("A", {
+                    "EMAIL_ADDRESS": "default@test.invalid", "EMAIL_PASSWORD": "default-password",
+                    "EMAIL_IMAP_HOST": "imap.default.invalid", "EMAIL_SMTP_HOST": "smtp.default.invalid",
+                    "EMAIL_ALLOW_ALL_USERS": "true",
+                }),
+            ):
+                home = Path(root) / label
+                home.mkdir(exist_ok=True)
+                scope_token = ss.set_secret_scope(secrets)
+                home_token = set_hermes_home_override(home)
+                try:
+                    imap = self._imap_for(raw)
+                    adapter = self._make_adapter()
+                    adapter._dispatch_message = AsyncMock()
+                    with patch("imaplib.IMAP4_SSL", return_value=imap):
+                        asyncio.run(adapter._check_inbox())
+                    stored = any(call.args[0] == "store" for call in imap.uid.call_args_list)
+                    if label == "B":
+                        self.assertFalse(stored, "B must not acknowledge A's allow-all policy")
+                        self.assertEqual(adapter._pending_auth_retries, {b"7"})
+                        self.assertEqual(adapter._auth_retry_state_path.parent, home / "state")
+                        adapter._dispatch_message.assert_not_awaited()
+                    else:
+                        self.assertTrue(stored)
+                        self.assertEqual(adapter._pending_auth_retries, set())
+                finally:
+                    reset_hermes_home_override(home_token)
+                    ss.reset_secret_scope(scope_token)
+            self.assertEqual(verify.call_count, 1)
 
     def test_direct_dkim_reverification_requires_an_aligned_valid_signature(self):
         """The retry path independently validates the original raw message."""
