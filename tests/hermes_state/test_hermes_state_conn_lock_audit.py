@@ -24,6 +24,8 @@ This is an AST audit in the spirit of
 import ast
 from pathlib import Path
 
+from tests.hermes_state._writer_lock_audit import verified_writer_with_ids
+
 # Functions allowed to touch self._conn without the lock: construction-time
 # code that runs before the instance is ever shared with another thread.
 _ALLOWED_UNLOCKED_FNS = frozenset({
@@ -57,17 +59,29 @@ def _unlocked_conn_calls(tree: ast.AST):
     """Return (lineno, enclosing_fn, method) for each self._conn.<m>(...)
     call that is not lexically inside a ``with self._lock:`` block."""
     locked_ids = set()
+
+    def body_nodes(node):
+        # A function/class defined under the lock can run after it is released.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            return
+        yield node
+        for child in ast.iter_child_nodes(node):
+            yield from body_nodes(child)
+
+    verified_withs = verified_writer_with_ids(tree)
     for node in ast.walk(tree):
         if isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
                 ctx = item.context_expr
                 if (
-                    isinstance(ctx, ast.Attribute)
-                    and ctx.attr == "_lock"
-                    and isinstance(ctx.value, ast.Name)
-                    and ctx.value.id == "self"
+                    id(node) in verified_withs
+                    or (isinstance(ctx, ast.Attribute)
+                        and ctx.attr == "_lock"
+                        and isinstance(ctx.value, ast.Name)
+                        and ctx.value.id == "self")
                 ):
-                    locked_ids.update(id(child) for child in ast.walk(node))
+                    locked_ids.update(id(child) for statement in node.body
+                                      for child in body_nodes(statement))
 
     enclosing = _nearest_enclosing_fn(tree)
 

@@ -29,6 +29,7 @@ import time
 import pytest
 
 from hermes_state import SessionDB
+from tests.hermes_state._writer_lock_audit import verified_writer_with_ids
 
 
 @pytest.fixture
@@ -135,6 +136,7 @@ class TestConcurrentReadersDoNotRaceTheWriter:
 
         src = inspect.getsource(hs)
         tree = ast.parse(src)
+        verified_withs = verified_writer_with_ids(tree)
 
         ALLOWED_FUNCS = {
             # Lifecycle: run before the instance is shared / after readers
@@ -148,6 +150,8 @@ class TestConcurrentReadersDoNotRaceTheWriter:
 
         def is_lock_with(node):
             if isinstance(node, ast.With):
+                if id(node) in verified_withs:
+                    return True
                 for item in node.items:
                     ctx = item.context_expr
                     if (isinstance(ctx, ast.Attribute)
@@ -185,6 +189,11 @@ class TestConcurrentReadersDoNotRaceTheWriter:
                     self.lock_depth += 1
                 if is_func:
                     self.func_stack.append(node.name)
+                # A nested function can be called after the surrounding lock
+                # is released; only its own with-blocks count as locked.
+                enclosing_lock_depth = self.lock_depth
+                if is_func:
+                    self.lock_depth = 0
                 if isinstance(node, ast.Call) and self.lock_depth == 0:
                     # A method call ON the connection (self._conn.execute(...))
                     func = node.func
@@ -197,10 +206,11 @@ class TestConcurrentReadersDoNotRaceTheWriter:
                         if self._is_conn_attr(arg):
                             self._flag(arg)
                 super().generic_visit(node)
+                if is_func:
+                    self.lock_depth = enclosing_lock_depth
+                    self.func_stack.pop()
                 if locked:
                     self.lock_depth -= 1
-                if is_func:
-                    self.func_stack.pop()
 
         Sweep().visit(tree)
         assert violations == [], (
