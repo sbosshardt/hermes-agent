@@ -1,6 +1,21 @@
 # Local Patch Inventory — Execreations Hermes Agent
 
-## Release window (candidate, not yet deployed)
+## DEPLOYMENT VERIFIED — v2026.9.21 / Hermes v0.21.4
+
+- Verified at **2026-09-24T02:10:46.092180+00:00**; supervisor `hermes-v2026-9-21-cutover-final-20260924T015737.service`.
+- Deployed runtime/source: `52f0372c61b51d28ac96526cec695a4cf452fd36`; tested code `ff00765fd37ee0ec078fa16048ebd66b53fd7ea4`.
+- Scope: **seven gateways** (default, TowTargetDev, CardRewards, EthereumCase, pi-3b-admin, pi-4b-admin, Creative), dashboard and Nous proxy. Creative shares this runtime; the older separate-runtime exclusion below is historical.
+- All nine new PIDs, per-profile required adapter records, default API v0.21.4, dashboard/API anonymous denial, authenticated proxy and external Hindsight health passed supervisor and independent finalizer checks. No fresh inbound human message round-trip is claimed.
+- Fork candidate SHA pushed with exact expected-old lease and read back before this docs-only closeout. Runtime code is unchanged by this documentation commit.
+- Copied-state rehearsal: 11/11 databases retained sessions/messages and integrity, with six telemetry columns; fresh verified post-stop rollback snapshot recorded in the cutover log.
+- Aggregate remains **55,405 passed, 25 clean-tag-reproduced failures, 579 skipped**; accepted baseline risk, not a clean full-suite pass. Operator and documentation regression suite: 76 passed.
+- Local cutover tooling and logs: `/home/hermes/.hermes/cache/release_validation/`. No upstream issue/PR/comment is authorized or created by this deployment.
+
+## Historical pre-cutover checkpoint
+
+The original audit below is preserved as historical evidence. Its candidate/not-deployed, pending cutover, and six-profile statements are superseded by the verified deployment record above. Patch rationales and upstream tracking remain applicable.
+
+### Release window (candidate, not yet deployed)
 
 - **Baseline:** upstream stable `v2026.9.21` (Hermes Agent `v0.21.4`). The maintained `execreations` checkout and `sbosshardt/execreations` still point to `419ef2a84d` on this checkpoint; this candidate is an isolated branch/worktree.
 - **Rollback refs:** `backup/pre-v2026.9.21-20260922T231333Z` and tag `backup-pre-v2026.9.21-20260922T231333Z` at `419ef2a84d`.
@@ -9,7 +24,7 @@
 
 Only intentional runtime deltas relative to `v2026.9.21` are listed below. Test-only adjustments belong to the behavior they validate.
 
-## Candidate runtime carries
+### Candidate runtime carries
 
 | Candidate commit(s) | Area / files | Still-unique invariant | Retirement condition |
 |---|---|---|---|
@@ -26,14 +41,14 @@ Only intentional runtime deltas relative to `v2026.9.21` are listed below. Test-
 
 **Pending before release:** the security-sensitive Codex history repair and reviewed follow-ups passed focused candidate tests and the candidate-regression comparison from the aggregate run. Do not call the nonzero aggregate run a clean pass: operationally assess its 25 clean-tag-reproduced failures, rehearse final copied-state migration, refresh rollback assets, then verify all shared profiles after coordinated cutover. Chat observation means assembled request only; Codex observation means acknowledged submitted input, not a completed model response.
 
-## Retired or trimmed from the prior deployment
+### Retired or trimmed from the prior deployment
 
 - `3998d0747b` (provider-agnostic `memory.sync_recall` opt-in) is **retired for current config**, not claimed upstream-equivalent. Active inspected profiles have it false/unset; default, TowTargetDev, and EthereumCase use agent-driven Hindsight tools mode. Reassess before re-enabling it.
 - The ambient-base-URL leak portion of `4e3e6690b6`/`77770c23db` is trimmed because the tag scopes secrets/profile config. The launcher-aware probe is retained in `848a5e3d90`; do not restore global `importlib` monkeypatches from `0700607347`.
 - The old Hindsight join body from `69d5e21fc9` is split and adapted to the new provider/turn-context architecture; it was not blindly cherry-picked.
 - Historical split email sources `9f08f13132`, `f76048bf52`, `c1259f38eb`, and `d9890f7503` remain retired. Replay neither their superseded commits nor the old composite source without the new release-tag adaptation.
 
-## Validation gate (in progress)
+### Validation gate (in progress)
 
 - Post-reboot built-in live-system guard canary: **49 passed**. Optional external `pytest_live_guard.py` is absent, so the canonical wrapper must not explicitly import it.
 - Intermediate gates: title/email **145 passed**, memory/session boundary **123 passed**, Codex/Hindsight/email robustness **213 passed**. After telemetry integration, candidate memory/Codex slice **185 passed** and relocated state suite **285 passed, 2 skipped**; the prior memory-worker focus **220 passed** is not integrated-candidate evidence. After chat append integration, candidate telemetry/Insights **70 passed** across two discovered files, and state metrics/send-path/replay **22 passed** across three files; a third named path in the former command did not exist and is not counted. The first Codex isolated repairs passed narrow tests but failed independent review; their subsequent reviewed security/ACK/post-ACK follow-ups are now integrated. Combined candidate Codex/telemetry slice **203 passed across eight files**, and the new real prefetch-to-ACK integration test brought its file to **48 passed** (four new parameter cases). Combined candidate after independently reviewed `14990275e3`: **268 passed across 12 files**, including live-guard self-test. The superseded prior broad run stopped near 4.6% after an independent review BLOCK; its eight early failures were caused by missing optional Anthropic SDK in the candidate test venv, and all six affected files passed **327/327** after adding pinned `anthropic==0.87.0` to that isolated venv. These are focused, not full-suite results.
