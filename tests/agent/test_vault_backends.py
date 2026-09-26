@@ -41,6 +41,8 @@ if argv[:2] == ["unlock", "--raw"]:
     print("SESSION-TOKEN-123"); sys.exit(0)
 if os.environ.get("BW_SESSION") != "SESSION-TOKEN-123":
     sys.stderr.write("Vault is locked.\n"); sys.exit(1)
+if argv[:2] == ["sync", "--nointeraction"]:
+    print("Sync complete"); sys.exit(0)
 if argv[:2] == ["list", "items"]:
     print(json.dumps([{"id": "abc", "type": 1, "name": "Example", "creationDate": "2026-01-01T00:00:00Z",
                        "login": {"username": "jane@example.com", "uris": [{"uri": "https://example.com/login"}]}},

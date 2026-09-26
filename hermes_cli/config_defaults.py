@@ -2402,6 +2402,13 @@ DEFAULT_CONFIG = {
         "bitwarden": {
             "enabled": True,        # `bw` CLI (Password Manager, not Secrets Manager); run `bw login` once first.
             "binary_path": "",      # absolute path to bw; empty = PATH.
+            # Opt-in only for a dedicated bot account. Read a profile-local 0600 one-line password
+            # file (raw or BW_PASSWORD=...) and check account_email before a headless unlock.
+            "unattended_password_file": "",
+            "account_email": "",
+            # Required with unattended_password_file; private mode-0700 CLI state directory under
+            # THIS profile's vault/ tree. Never inherit another profile's or the user's CLI cache.
+            "appdata_dir": "",
         },
     },
     "secrets": {

@@ -67,6 +67,58 @@ origins; nothing is inferred beyond the URLs saved on the item.
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
 
+### Dedicated Bitwarden bot account in unattended sessions
+
+The normal Bitwarden integration asks for an unlock through a masked CLI/Desktop
+prompt. To use an **agent-only** Bitwarden Password Manager account in Telegram,
+cron or another unattended session without keeping a second Hermes login item,
+an operator may opt in to a protected, profile-local unlock file:
+
+```yaml
+vault:
+  bitwarden:
+    enabled: true
+    binary_path: /home/agent/.local/bin/bw
+    account_email: bot@example.com
+    unattended_password_file: /home/agent/.hermes/secrets/bitwarden-unlock.env
+    appdata_dir: /home/agent/.hermes/vault/bitwarden-cli
+```
+
+Sign in the `bw` CLI once as **that exact account** with
+`BITWARDENCLI_APPDATA_DIR=/home/agent/.hermes/vault/bitwarden-cli` in its
+environment; verify `bw status` with that same appdata path. Create the
+appdata directory with mode `0700` inside the selected profile's `vault/`
+directory. Never point it to the operator's default `bw` state or to another
+Hermes profile. The master-password file must be inside that profile's
+`secrets/` directory, owned by the process user, a regular non-symlink file
+with mode `0600`, and contain exactly one line:
+the raw master password or `BW_PASSWORD=<master password>`. Never place that
+value in `config.yaml`, a shell command, or the conversation. Both directories
+and every checked parent must be owner-controlled (not group/world-writable),
+and symlink path components below the resolved profile root are rejected. The
+browser backend checks the signed-in account against the configured email before
+each CLI operation and unlocks with `bw --passwordenv` using the CLI child's
+environment, retains the session token only in process memory, and syncs before
+listing logins so newly shared or rotated items are used. It
+returns only handles and login identifiers to the agent; actual passwords are
+resolved at fill time and injected only on an exact website origin from the
+Bitwarden item's URI list. The `bw list items` CLI returns full decrypted item
+JSON *internally* to the trusted backend before it strips the password fields
+for the agent; this design does not provide per-item decryption or prevent a
+compromised host user from accessing the dedicated account. Add the **real
+sign-in origin**, not just a site's marketing homepage, to each Bitwarden
+Login. Automatic codes generated from a saved TOTP seed are likewise refused
+unless the code page has one of the login's bound origins. When this mode is
+configured, browser onboarding refuses to create another Hermes-local copy;
+add new logins to the dedicated Bitwarden account.
+
+This is a deliberate security tradeoff: an attacker who controls the host user
+and that file can unlock the bot account. Restrict the account to collections
+of credentials the agent is authorized to use, protect and recover its bootstrap
+separately, and never use this option for your personal full-access vault. The
+setting is off by default; without it, unattended sessions still cannot unlock
+Bitwarden and fail closed.
+
 ## Paying and filling addresses
 
 Cards and addresses work the same way as logins: saved once (**Settings →
@@ -92,10 +144,11 @@ the page.
 ## Headless sessions
 
 Cron jobs, webhooks, the API server and `hermes chat -q` have nobody to answer a
-prompt. Saved local logins keep working there; a locked password manager reports
-`unavailable_in_this_session` and a missing login reports `prompt_unavailable`.
-Unlock or save from an interactive session first, or give 1Password a service
-account token (`OP_SERVICE_ACCOUNT_TOKEN`).
+prompt. Saved local logins keep working there; by default, a locked password
+manager reports `unavailable_in_this_session` and a missing login reports
+`prompt_unavailable`. The opt-in dedicated Bitwarden bot configuration above
+can unlock without a prompt; 1Password can use a service account token
+(`OP_SERVICE_ACCOUNT_TOKEN`).
 
 ```yaml
 vault:
@@ -105,6 +158,8 @@ vault:
     service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN
   bitwarden:
     enabled: false
+    account_email: ""                # required for unattended_password_file
+    unattended_password_file: ""      # disabled by default; profile-local 0600 file
 ```
 
 ## What this does and does not guarantee

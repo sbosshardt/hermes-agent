@@ -218,13 +218,18 @@ def browser_vault_list() -> str:
     items, locked, errors = [], [], []
     for backend in enabled_backends():
         if backend.needs_unlock and not backend.is_unlocked():
-            locked.append({"backend": backend.name, "display_name": backend.display_name,
-                           "unlock": "browser_vault_unlock" if can_prompt_here() else "unavailable_in_this_session"})
-            continue
+            try:
+                backend.try_unattended_unlock()
+            except Exception:
+                errors.append({"backend": backend.name, "error": "Unattended vault unlock failed; check the bot account and bootstrap configuration."})
+            if not backend.is_unlocked():
+                locked.append({"backend": backend.name, "display_name": backend.display_name,
+                               "unlock": "browser_vault_unlock" if can_prompt_here() else "unavailable_in_this_session"})
+                continue
         try:
             metas = backend.list_items()
-        except Exception as exc:
-            errors.append({"backend": backend.name, "error": str(exc)[:200]})
+        except Exception:
+            errors.append({"backend": backend.name, "error": "Vault backend read failed; no saved values were used."})
             continue
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
@@ -239,8 +244,15 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault_save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        from agent.vault_backends.base import _cfg
+        bw_cfg = _cfg().get("bitwarden") or {}
+        if isinstance(bw_cfg, dict) and bw_cfg.get("unattended_password_file"):
+            out["hint"] = ("The dedicated Bitwarden bot is the login source; if it is locked or has no "
+                           "matching login, fix the bot account or add the exact sign-in URI there. Do not "
+                           "create a second Hermes login copy.")
+        else:
+            out["hint"] = ("No saved logins. On a login page, call browser_vault_save_login to ask the user to save one. "
+                           "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -258,6 +270,12 @@ def browser_vault_unlock(backend_name: str) -> str:
         return json.dumps({"success": False, "error": f"No unlockable vault backend named {backend_name!r}."})
     if backend.is_unlocked():
         return json.dumps({"success": True, "backend": backend.name, "already_unlocked": True})
+    try:
+        if backend.try_unattended_unlock():
+            return json.dumps({"success": True, "backend": backend.name, "unattended": True})
+    except Exception:
+        return json.dumps({"success": False, "error_type": "unlock_failed",
+                           "error": f"{backend.display_name} unattended unlock failed; check bot account and bootstrap configuration."})
     if not can_prompt_here():
         return json.dumps({"success": False, "error_type": "unlock_unavailable",
                            "error": (f"{backend.display_name} is locked and this session cannot prompt for the "
@@ -281,6 +299,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local
     vault bound to that origin, and fill the password at once. The values never enter the conversation."""
     from agent.vault_backends.unlock import can_prompt_here, get_save_login_prompt_callback
+    from agent.vault_backends.base import _cfg
     from agent.vault_store import get_vault_store
 
     effective_task_id = task_id or "default"
@@ -290,6 +309,12 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
+    bw_cfg = _cfg().get("bitwarden") or {}
+    if isinstance(bw_cfg, dict) and bw_cfg.get("unattended_password_file"):
+        return json.dumps({"success": False, "error_type": "bitwarden_source_of_truth",
+                           "error": ("This profile uses the dedicated Bitwarden bot for logins. Add the "
+                                     f"login with the exact URI {origin} to Bitwarden; do not create a second "
+                                     "Hermes-local password copy.")})
     prompt = get_save_login_prompt_callback()
     if prompt is None or not can_prompt_here():
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
@@ -327,7 +352,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
     socket and never enters the conversation."""
     from agent.redact import register_vault_redaction_value
-    from agent.vault_backends import backend_for_handle
+    from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
@@ -353,6 +378,25 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     source = "user"
     backend = backend_for_handle(handle) if handle else None
     if backend is not None:
+        if backend.needs_unlock and not backend.is_unlocked():
+            unlocked = json.loads(browser_vault_unlock(backend.name))
+            if not unlocked.get("success"):
+                return json.dumps(unlocked)
+        try:
+            meta = backend.get_meta(handle)
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": "Vault locked again; no code was entered."})
+        except Exception:
+            return json.dumps({"success": False, "error_type": "vault_unavailable",
+                               "error": "Vault login could not be read; no code was entered."})
+        if meta is None:
+            return json.dumps({"success": False, "error_type": "invalid_handle",
+                               "error": "No saved login matches the supplied handle; no code was entered."})
+        allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+        if origin not in allowed:
+            return json.dumps({"success": False, "error_type": "origin_mismatch",
+                               "error": "Refused to enter a saved code on an origin not bound to this login."})
         try:
             code = backend.resolve_otp(handle)
         except Exception:
@@ -420,6 +464,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+    except Exception:
+        return json.dumps({"success": False, "error_type": "vault_unavailable",
+                           "error": "Vault metadata could not be read; no password was filled."})
     if meta is None:
         return json.dumps(
             {
@@ -502,6 +549,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+    except Exception:
+        return json.dumps({"success": False, "error_type": "vault_unavailable",
+                           "error": "Vault login could not be resolved; no password was filled."})
     if not fills:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
