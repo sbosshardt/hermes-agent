@@ -229,13 +229,18 @@ def browser_vault_list() -> str:
     items, locked, errors = [], [], []
     for backend in enabled_backends():
         if backend.needs_unlock and not backend.is_unlocked():
-            locked.append({"backend": backend.name, "display_name": backend.display_name,
-                           "unlock": "browser_vault_unlock" if can_prompt_here() else "unavailable_in_this_session"})
-            continue
+            try:
+                backend.try_unattended_unlock()
+            except Exception:
+                errors.append({"backend": backend.name, "error": "Unattended vault unlock failed; check the bot account and bootstrap configuration."})
+            if not backend.is_unlocked():
+                locked.append({"backend": backend.name, "display_name": backend.display_name,
+                               "unlock": "browser_vault_unlock" if can_prompt_here() else "unavailable_in_this_session"})
+                continue
         try:
             metas = backend.list_items()
-        except Exception as exc:
-            errors.append({"backend": backend.name, "error": str(exc)[:200]})
+        except Exception:
+            errors.append({"backend": backend.name, "error": "Vault backend read failed; no saved values were used."})
             continue
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
@@ -243,15 +248,25 @@ def browser_vault_list() -> str:
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
-                entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
+                if backend.name == "bitwarden" and getattr(backend, "cfg", {}).get("unattended_password_file"):
+                    entry["two_factor"] = "user prompt only; unattended saved TOTP is disabled pending origin binding"
+                else:
+                    entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault_save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        from agent.vault_backends.base import _cfg
+        bw_cfg = _cfg().get("bitwarden") or {}
+        if isinstance(bw_cfg, dict) and bw_cfg.get("enabled") is not False and bw_cfg.get("unattended_password_file"):
+            out["hint"] = ("The dedicated Bitwarden bot is the login source; if it is locked or has no "
+                           "matching login, fix the bot account or add the exact sign-in URI there. Do not "
+                           "create a second Hermes login copy.")
+        else:
+            out["hint"] = ("No saved logins. On a login page, call browser_vault_save_login to ask the user to save one. "
+                           "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -262,6 +277,7 @@ def browser_vault_list() -> str:
 def browser_vault_unlock(backend_name: str) -> str:
     """Ask the user (via the surface's masked prompt) to unlock an external manager for this session."""
     from agent.vault_backends import enabled_backends
+    from agent.vault_backends.bitwarden import UnattendedUnlockRejected
     from agent.vault_backends.unlock import can_prompt_here, get_unlock_prompt_callback
 
     backend = next((b for b in enabled_backends() if b.name == backend_name and b.needs_unlock), None)
@@ -269,6 +285,18 @@ def browser_vault_unlock(backend_name: str) -> str:
         return json.dumps({"success": False, "error": f"No unlockable vault backend named {backend_name!r}."})
     if backend.is_unlocked():
         return json.dumps({"success": True, "backend": backend.name, "already_unlocked": True})
+    try:
+        if backend.try_unattended_unlock():
+            return json.dumps({"success": True, "backend": backend.name, "unattended": True})
+    except UnattendedUnlockRejected:
+        if not can_prompt_here():
+            return json.dumps({"success": False, "error_type": "unlock_failed",
+                               "error": f"{backend.display_name} unattended unlock failed; check the bot account and bootstrap configuration."})
+        # Only a CLI-rejected password gets the owner's masked attended recovery prompt.
+        # A wrong account or unsafe file/path must remain a hard stop.
+    except Exception:
+        return json.dumps({"success": False, "error_type": "unlock_failed",
+                           "error": f"{backend.display_name} unattended unlock failed; check bot account and bootstrap configuration."})
     if not can_prompt_here():
         return json.dumps({"success": False, "error_type": "unlock_unavailable",
                            "error": (f"{backend.display_name} is locked and this session cannot prompt for the "
@@ -292,6 +320,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local
     vault bound to that origin, and fill the password at once. The values never enter the conversation."""
     from agent.vault_backends.unlock import can_prompt_here, get_save_login_prompt_callback
+    from agent.vault_backends.base import _cfg
     from agent.vault_store import get_vault_store
 
     effective_task_id = task_id or "default"
@@ -301,6 +330,12 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
+    bw_cfg = _cfg().get("bitwarden") or {}
+    if isinstance(bw_cfg, dict) and bw_cfg.get("enabled") is not False and bw_cfg.get("unattended_password_file"):
+        return json.dumps({"success": False, "error_type": "bitwarden_source_of_truth",
+                           "error": ("This profile uses the dedicated Bitwarden bot for logins. Add the "
+                                     f"login with the exact URI {origin} to Bitwarden; do not create a second "
+                                     "Hermes-local password copy.")})
     prompt = get_save_login_prompt_callback()
     if prompt is None or not can_prompt_here():
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
@@ -373,9 +408,15 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     if not code:
         prompt = get_code_prompt_callback()
         if prompt is None or not can_prompt_here():
+            unattended_bw = (backend is not None and backend.name == "bitwarden" and
+                             getattr(backend, "cfg", {}).get("unattended_password_file"))
+            guidance = ("Saved Bitwarden TOTP is disabled in unattended mode until origin binding is available. "
+                        "Use an interactive session to ask the user for the code."
+                        if unattended_bw else
+                        "Save an authenticator key for this login so codes can be generated automatically.")
             return json.dumps({"success": False, "error_type": "prompt_unavailable",
                                "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
-                                         "Save an authenticator key for this login so codes can be generated automatically.")})
+                                         f"{guidance}")})
         code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
         if not code:
             return json.dumps({"success": False, "error_type": "code_declined",
@@ -431,6 +472,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+    except Exception:
+        return json.dumps({"success": False, "error_type": "vault_unavailable",
+                           "error": "Vault metadata could not be read; no password was filled."})
     if meta is None:
         return json.dumps(
             {
@@ -513,6 +557,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+    except Exception:
+        return json.dumps({"success": False, "error_type": "vault_unavailable",
+                           "error": "Vault login could not be resolved; no password was filled."})
     if not fills:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}

@@ -67,6 +67,47 @@ origins; nothing is inferred beyond the URLs saved on the item.
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
 
+### Opt-in unattended Bitwarden Password Manager unlock
+
+By default, Bitwarden asks for a masked, attended unlock; headless sessions cannot
+unlock it. An operator using a **dedicated agent-authorized** Password Manager
+account can opt in to a protected, profile-local bootstrap file instead. This
+option requires POSIX owner and no-follow file checks; it is not supported on
+Windows:
+
+```yaml
+vault:
+  bitwarden:
+    account_email: bot@example.com
+    unattended_password_file: /home/agent/.hermes/secrets/bitwarden-unlock.env
+    appdata_dir: /home/agent/.hermes/vault/bitwarden-cli
+```
+
+Sign in to `bw` once as the configured account with the same
+`BITWARDENCLI_APPDATA_DIR`; do not use another profile's CLI state. The appdata
+directory must be mode `0700` within this profile's `vault/` directory. The
+password file must be a regular, non-symlink mode-`0600` file within this
+profile's `secrets/` directory, containing one line (raw master password or
+`BW_PASSWORD=<master password>`). Parents must be owner-controlled. Never put
+the password in the YAML, a command argument, or a chat message.
+
+With this configuration, Hermes checks the CLI account before using a session,
+unlocks through the CLI child's `--passwordenv` (not argv), and synchronizes
+before listing or resolving a login. Handles and identifiers may reach the
+agent, but decrypted items are processed inside the trusted backend and password
+fills remain exact-origin. A failed account check or sync refuses the operation;
+the browser onboarding path does not make an additional Hermes-local copy.
+Saved Bitwarden TOTP is **not minted in this unattended mode** while origin
+binding for the code page is handled separately. An interactive session can
+still ask the owner for a one-time code; a headless session cannot. If the
+bootstrap's password stops working, an interactive session may recover using
+a masked prompt; unsafe paths or account mismatches never fall back.
+
+**Tradeoff:** A compromised host user with access to the bootstrap file can
+unlock this Bitwarden account. Limit its collections to agent-authorized logins,
+secure and recover the bootstrap separately, and do not use a personal vault.
+This does not enable unattended unlock for any other manager or profile.
+
 ## Paying and filling addresses
 
 Cards and addresses work the same way as logins: saved once (**Settings →
@@ -94,8 +135,9 @@ the page.
 Cron jobs, webhooks, the API server and `hermes chat -q` have nobody to answer a
 prompt. Saved local logins keep working there; a locked password manager reports
 `unavailable_in_this_session` and a missing login reports `prompt_unavailable`.
-Unlock or save from an interactive session first, or give 1Password a service
-account token (`OP_SERVICE_ACCOUNT_TOKEN`).
+Unlock or save from an interactive session first, opt in to the dedicated
+Bitwarden account above, or give 1Password a service account token
+(`OP_SERVICE_ACCOUNT_TOKEN`).
 
 ```yaml
 vault:
