@@ -1617,7 +1617,12 @@ def run_conversation(
     addresses, after every history rewrite including post-turn micro-compaction.
     """
     from agent.turn_context import export_current_turn_boundary
+    from agent.chat_completion_helpers import _reset_stale_streak
     from tools.vision_tools_history_budget import native_turn_images
+
+    # A cached agent must allow a fresh user turn after a previous turn gave up.
+    # Retry/tool rounds inside this turn still share the same bounded streak.
+    _reset_stale_streak(agent)
 
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
