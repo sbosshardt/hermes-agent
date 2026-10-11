@@ -1,30 +1,15 @@
-# Local Patch Inventory — Execreations Hermes Agent
+# Execreations Hermes Agent — maintained patch inventory
 
-## DEPLOYMENT VERIFIED — v2026.9.21 / Hermes v0.21.4
+## Canonical branch contract
 
-- Verified at **2026-09-24T02:10:46.092180+00:00**; supervisor `hermes-v2026-9-21-cutover-final-20260924T015737.service`.
-- Deployed runtime/source: `52f0372c61b51d28ac96526cec695a4cf452fd36`; tested code `ff00765fd37ee0ec078fa16048ebd66b53fd7ea4`.
-- Scope: **seven gateways** (default, TowTargetDev, CardRewards, EthereumCase, pi-3b-admin, pi-4b-admin, Creative), dashboard and Nous proxy. Creative shares this runtime; the older separate-runtime exclusion below is historical.
-- All nine new PIDs, per-profile required adapter records, default API v0.21.4, dashboard/API anonymous denial, authenticated proxy and external Hindsight health passed supervisor and independent finalizer checks. No fresh inbound human message round-trip is claimed.
-- Fork candidate SHA pushed with exact expected-old lease and read back before this docs-only closeout. Runtime code is unchanged by this documentation commit.
-- Copied-state rehearsal: 11/11 databases retained sessions/messages and integrity, with six telemetry columns; fresh verified post-stop rollback snapshot recorded in the cutover log.
-- Aggregate remains **55,405 passed, 25 clean-tag-reproduced failures, 579 skipped**; accepted baseline risk, not a clean full-suite pass. Operator and documentation regression suite: 76 passed.
-- Local cutover tooling and logs: `/home/hermes/.hermes/cache/release_validation/`. No upstream issue/PR/comment is authorized or created by this deployment.
+- `execreations` is the complete accepted runtime/test portfolio, both locally and in `sbosshardt/hermes-agent`. Publish reviewed accepted commits to the same branch and verify exact SHA equality; dated `backup/*` branches are historical snapshots, not the current deployment line.
+- Runtime baseline remains upstream stable `v2026.9.21` (Hermes Agent `v0.21.4`). Synchronizing the fork does not adopt unreleased upstream `main`, reinstall dependencies or restart services.
+- This public ledger contains source-level rationale and retirement criteria. Private deployment logs, session evidence and original unpublished operational history are retained separately, not added to public Git history.
+- The canonical-sync candidate uses the already-published `9cd29ea5990d3a900fe148959937aaa09a10ef18` tree. All tracked runtime/test files and modes match the previously maintained checkout. Only these two public patch-ledger documents change.
 
-## Historical pre-cutover checkpoint
+## Accepted release-port carries
 
-The original audit below is preserved as historical evidence. Its candidate/not-deployed, pending cutover, and six-profile statements are superseded by the verified deployment record above. Patch rationales and upstream tracking remain applicable.
-
-### Release window (candidate, not yet deployed)
-
-- **Baseline:** upstream stable `v2026.9.21` (Hermes Agent `v0.21.4`). The maintained `execreations` checkout and `sbosshardt/execreations` still point to `419ef2a84d` on this checkpoint; this candidate is an isolated branch/worktree.
-- **Rollback refs:** `backup/pre-v2026.9.21-20260922T231333Z` and tag `backup-pre-v2026.9.21-20260922T231333Z` at `419ef2a84d`.
-- **Initial verified backup:** `/home/hermes/.hermes/backups/v2026.9.21-20260922T231333Z/` (69 items, including online SQLite state backups). Refresh immediately before cutover: TowTargetDev `/topic` was enabled after that snapshot.
-- **Execution state:** Candidate is not the running runtime; telemetry storage/Insights, assembled chat-request append observation, reviewed Codex history/ACK/post-ACK append repairs, and a scoped test-only SQLite writer-lock audit repair are integrated. The aggregate suite ran at `ff00765fd3`: 55,405 passed, 25 final failures, 579 skipped; all 25 exact failed IDs reproduced on the clean release tag, with no candidate-only failures. This is **baseline-comparative evidence, not a green full-suite pass**. Operational criticality review, final copied-state migration, rollback refresh, and production smoke gates remain open. Production branch/venv/services/fork have not moved. Samuel approved a fresh-lease guarded fork rewrite and a brief coordinated six-gateway outage followed by serial startup **only after** all validation and rollback gates pass; Creative remains separate.
-
-Only intentional runtime deltas relative to `v2026.9.21` are listed below. Test-only adjustments belong to the behavior they validate.
-
-### Candidate runtime carries
+The following source-level units were accepted on the maintained release branch. Provenance identifiers identify the release-port commits; cherry-picked implementations need not have the same ancestry as historical topic branches.
 
 | Candidate commit(s) | Area / files | Still-unique invariant | Retirement condition |
 |---|---|---|---|
@@ -39,21 +24,35 @@ Only intentional runtime deltas relative to `v2026.9.21` are listed below. Test-
 | `848a5e3d90` | `plugins/memory/hindsight/embedded.py`, provider/probe tests | Recognize the lightweight `hindsight-embed==0.9.2` wrapper/`uvx` launcher instead of requiring heavy host-stack imports. | Upstream probes the installed isolated launcher API and health without false negatives. |
 | `ee748995dd`, `022dcd1b37`, `92f7a4979a`, `3c3b0b9596` | Email adapter, email tests, `pyproject.toml`, `uv.lock` | Fail-closed trusted/aligned DKIM DNS `temperror` retry across disconnects/restarts with mailbox/profile-scoped durable state and explicit IMAP acknowledgement before dispatch; pin/release-exempt `dkimpy==1.1.8`. | Upstream covers the complete trusted gating, transient-DNS handling, acknowledgement, state scope, and dependency/rollback tests. |
 
-**Pending before release:** the security-sensitive Codex history repair and reviewed follow-ups passed focused candidate tests and the candidate-regression comparison from the aggregate run. Do not call the nonzero aggregate run a clean pass: operationally assess its 25 clean-tag-reproduced failures, rehearse final copied-state migration, refresh rollback assets, then verify all shared profiles after coordinated cutover. Chat observation means assembled request only; Codex observation means acknowledged submitted input, not a completed model response.
+## Accepted post-release carries
 
-### Retired or trimmed from the prior deployment
+### Unattended Bitwarden browser vault and saved-origin OTP refusal
 
-- `3998d0747b` (provider-agnostic `memory.sync_recall` opt-in) is **retired for current config**, not claimed upstream-equivalent. Active inspected profiles have it false/unset; default, TowTargetDev, and EthereumCase use agent-driven Hindsight tools mode. Reassess before re-enabling it.
-- The ambient-base-URL leak portion of `4e3e6690b6`/`77770c23db` is trimmed because the tag scopes secrets/profile config. The launcher-aware probe is retained in `848a5e3d90`; do not restore global `importlib` monkeypatches from `0700607347`.
-- The old Hindsight join body from `69d5e21fc9` is split and adapted to the new provider/turn-context architecture; it was not blindly cherry-picked.
-- Historical split email sources `9f08f13132`, `f76048bf52`, `c1259f38eb`, and `d9890f7503` remain retired. Replay neither their superseded commits nor the old composite source without the new release-tag adaptation.
+- Published source: `c9a22014c0496e225dcb48bc935238faac369d51`.
+- Files: `agent/vault_backends/base.py`, `agent/vault_backends/bitwarden.py`, `tools/browser_vault_tool.py`, `hermes_cli/config_defaults.py`, vault tests and credential-vault documentation.
+- Behavior: explicit unattended opt-in, isolated CLI appdata, expected-account binding and freshness checks; saved OTP resolution requires an exact allowed page origin before code generation. Credentials never become model-visible values.
+- Classification: unattended unlock is an opt-in feature; saved-origin OTP refusal is a separate security fix. Historical overlap references include upstream #108316, #108930, #111143, #119682 and #119691; recheck current code/status before proposing anything upstream. The last detailed vault-overlap audit was 2026-09-25, not a current merge-status assertion.
+- Conflict risk: high in backend, browser-vault and configuration surfaces. Retirement requires released parity for every sub-behavior, not just one overlapping PR.
 
-### Validation gate (in progress)
+### Reset the stale-stream breaker at each fresh user turn
 
-- Post-reboot built-in live-system guard canary: **49 passed**. Optional external `pytest_live_guard.py` is absent, so the canonical wrapper must not explicitly import it.
-- Intermediate gates: title/email **145 passed**, memory/session boundary **123 passed**, Codex/Hindsight/email robustness **213 passed**. After telemetry integration, candidate memory/Codex slice **185 passed** and relocated state suite **285 passed, 2 skipped**; the prior memory-worker focus **220 passed** is not integrated-candidate evidence. After chat append integration, candidate telemetry/Insights **70 passed** across two discovered files, and state metrics/send-path/replay **22 passed** across three files; a third named path in the former command did not exist and is not counted. The first Codex isolated repairs passed narrow tests but failed independent review; their subsequent reviewed security/ACK/post-ACK follow-ups are now integrated. Combined candidate Codex/telemetry slice **203 passed across eight files**, and the new real prefetch-to-ACK integration test brought its file to **48 passed** (four new parameter cases). Combined candidate after independently reviewed `14990275e3`: **268 passed across 12 files**, including live-guard self-test. The superseded prior broad run stopped near 4.6% after an independent review BLOCK; its eight early failures were caused by missing optional Anthropic SDK in the candidate test venv, and all six affected files passed **327/327** after adding pinned `anthropic==0.87.0` to that isolated venv. These are focused, not full-suite results.
-- The currently running Hindsight daemon `/health` is healthy; the isolated test venv imports `hindsight-embed==0.9.2` and `dkimpy==1.1.8`. Candidate dashboard assets exist. This is a pre-cutover observation, not post-restart proof.
-- Copy-only telemetry migration rehearsal: **11/11 backup DBs** kept session counts and integrity, with six telemetry columns; rerun against a fresh final snapshot. The isolated candidate/test interpreter links SQLite 3.50.4; active runtime links 3.53.1 and must retain a safe version after sync.
-- Test-only bounded writer-lock audit `82066532f0`/`ff00765fd3`: independent spec/safety **PASS** and quality **APPROVED**; integrated candidate state/live-guard gate **382 passed, 4 skipped**. Fresh aggregate at exact runtime/test HEAD `ff00765fd37ee0ec078fa16048ebd66b53fd7ea4`: **4,793 files, 55,405 passed, 25 failed, 579 skipped**, plus one first-attempt TUI failure that passed on retry. Programmatic exact-ID comparison with both clean-tag failure runs yields **zero current-only failures**; the original two candidate-only AST failures are gone. This aggregate used the external test venv, `nice +10`, four workers and excluded Docker/E2E/external integration; it is **not** a green suite. This ledger update is documentation-only and postdates that tested SHA.
-- Offline migration helper dry run on the **older** snapshot verified 11/11 copied DBs with preserved session/message counts, intact SQLite and six telemetry columns. A **fresh snapshot** and rerun remain mandatory. `/home/hermes/.local/bin/hermes` was found pointing at the candidate venv after tests; it was atomically pointed back to the active production venv, and CLI `--version` verified v0.21.0. Dashboard and Nous proxy were not restarted.
-- **Still required:** independent operational criticality assessment of the 25 baseline failures; final copied-state/config migration and candidate config/CLI checks; refresh secure online backups and active-venv rollback copy; coordinated six-gateway cutover/rollback only if all gates pass; verify all affected profiles and external services. Creative remains on its separate v2026.8.3 runtime and must not have its live DB migrated by the shared checkout update.
+- Published source: `9cd29ea5990d3a900fe148959937aaa09a10ef18`.
+- Files: `agent/conversation_loop.py`, `tests/agent/test_stream_stale_breaker_reset.py`.
+- Behavior: call the existing `_reset_stale_streak` before the user-turn API guard. The next unchanged-provider user message can retry; repeated stalls inside the current turn remain bounded. No `/model` command is needed.
+- Historical overlap pointers: upstream #89587, #89804 and #89612. Half-open recovery is not automatically equivalent to a per-user-turn reset; validate exact behavior before retirement or proposing a PR.
+- Conflict risk: medium at conversation-loop entry and stale-breaker tests. Retire only when the chosen stable release satisfies both fresh-turn recovery and within-turn give-up.
+- Native Cursor event translation remains in the separate Cursor-provider plugin, not core or the installed SDK.
+
+## Retired or split-trimmed historical units
+
+- The prior synchronous current-turn recall opt-in is retired for the maintained deployment configuration, not claimed upstream-equivalent. Reassess before enabling that option.
+- Old ambient-base-URL isolation was trimmed where the selected release supplies profile-secret scoping; retain the launcher probe above and do not restore a global import monkeypatch.
+- Old Hindsight join and email composite commits were adapted to the release's new architecture. Do not stack their superseded full commits on top of the current port.
+
+## Verification scope
+
+The prior focused stale-reset gate passed 74 tests; the vault gate passed 94. Canonical-branch synchronization additionally checks source/blob/mode identity and reruns the focused stale-reset suite. This is not a new full-suite pass or a fresh runtime rollout. Preserve historical broad-suite baseline comparisons and private rollout receipts separately.
+
+## Maintenance gate
+
+Use stable release tags for runtime upgrades. For each carry, compare implementation, defaults, call sites and tests; classify keep, retire, rewrite or split-trim. Keep public source history clean, preserve rollback references, and obtain separate authorization before posting upstream issues/PRs/comments.
