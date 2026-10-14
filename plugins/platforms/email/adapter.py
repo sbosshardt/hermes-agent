@@ -3,6 +3,8 @@ receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in 
 
 import asyncio
 import email as email_lib
+import hashlib
+import json
 from contextlib import contextmanager, suppress
 import imaplib
 import logging
@@ -31,7 +33,8 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform, PlatformConfig
-from utils import is_truthy_value
+from utils import atomic_json_write, is_truthy_value
+from hermes_constants import get_hermes_home
 from gateway.platforms._shared import get_scoped_secret as _get_secret, coerce_port, decode_json_list_literal, send_error
 
 logger = logging.getLogger(__name__)
@@ -411,6 +414,98 @@ def _verify_sender_authentication(msg: email_lib.message.Message, from_addr: str
     return False, f"authentication failed ({trusted[:120]})"
 
 
+def _has_temporary_aligned_dkim_failure(
+    msg: email_lib.message.Message, from_addr: str, *, authserv_id: str,
+) -> bool:
+    """Only the topmost, exactly pinned receiver result may nominate a DKIM retry.
+
+    Use the target's clause parser: neither lower headers, comments, quoted
+    properties nor related authserv domains may supply a retry verdict.
+    """
+    from_domain = _domain_of(from_addr)
+    headers = msg.get_all("Authentication-Results") or []
+    if not from_domain or not authserv_id or not headers:
+        return False
+    clauses = _ar_clauses(" ".join(str(headers[0]).split()))
+    if clauses is None or clauses[0].strip().lower() != authserv_id:
+        return False
+    for clause in clauses[1:]:
+        match = _AUTH_METHOD_RE.match(clause)
+        if not match or (match.group(1).lower(), match.group(2).lower()) != ("dkim", "temperror"):
+            continue
+        domains = [value for prop, value in _auth_props(clause[match.end():]) if prop == "header.d"]
+        if domains and all(_domains_aligned(domain, from_domain) for domain in domains):
+            return True
+    return False
+
+
+def _verify_temporary_dkim(raw_email: bytes, from_addr: str) -> Tuple[bool, bool, str]:
+    """Verify original wire bytes; only DNS timeout or definitive SERVFAIL is retryable."""
+    try:
+        import dkim
+        import dns.exception
+        import dns.rcode
+        import dns.rdatatype
+        import dns.resolver
+    except ImportError:
+        logger.error("[Email] dkimpy is unavailable; retaining temporary auth failure")
+        return False, True, "DKIM re-verifier unavailable"
+    from_domain = _domain_of(from_addr)
+    if not from_domain:
+        return False, False, "missing From domain"
+    try:
+        verifier = dkim.DKIM(raw_email, timeout=5)
+    except (TypeError, ValueError):
+        return False, False, "invalid message for DKIM re-verification"
+    signature_count = sum(1 for name, _value in verifier.headers if name.lower() == b"dkim-signature")
+    if not signature_count:
+        return False, False, "no DKIM-Signature header"
+    dns_timed_out = False
+    dns_servfail = False
+
+    def dnsfunc(name: bytes, timeout: int = 5) -> bytes | None:
+        nonlocal dns_timed_out, dns_servfail
+        try:
+            answer = dns.resolver.resolve(name.decode("utf-8"), dns.rdatatype.TXT,
+                                          raise_on_no_answer=False, lifetime=timeout, search=True)
+            for rrset in answer.response.answer:
+                if rrset.rdtype == dns.rdatatype.TXT:
+                    return b"".join(list(rrset.items)[0].strings)
+        except (dns.resolver.NXDOMAIN, UnicodeDecodeError):
+            pass
+        except dns.resolver.NoNameservers as exc:
+            errors = exc.kwargs.get("errors", [])
+            if errors and all(len(error) >= 5 and error[4] is not None
+                              and error[4].rcode() == dns.rcode.SERVFAIL for error in errors):
+                dns_servfail = True
+        except (dns.resolver.NoResolverConfiguration, dns.exception.Timeout):
+            dns_timed_out = True
+            raise dkim.DnsTimeoutError("DNS resolver unavailable or timed out")
+        return None
+
+    for index in range(signature_count):
+        try:
+            prepared = verifier.verify_headerprep(index)
+        except (dkim.MessageFormatError, dkim.ValidationError, dkim.ParameterError):
+            continue
+        if not prepared:
+            continue
+        signature, include_headers, signature_headers = prepared
+        signing_domain = signature.get(b"d", b"").decode("ascii", "ignore")
+        if not _domains_aligned(signing_domain, from_domain):
+            continue
+        try:
+            if verifier.verify_sig(signature, include_headers, signature_headers[index], dnsfunc):
+                return True, False, f"dkim=pass reverified ({signing_domain})"
+        except (dkim.MessageFormatError, dkim.ValidationError, dkim.KeyFormatError, dkim.UnknownKeyTypeError):
+            continue
+    if dns_timed_out:
+        return False, True, "DKIM DNS lookup timed out"
+    if dns_servfail:
+        return False, True, "DKIM DNS SERVFAIL"
+    return False, False, "DKIM re-verification failed"
+
+
 def _extract_attachments(msg: email_lib.message.Message, skip_attachments: bool = False) -> List[Dict[str, Any]]:
     """Extract attachment metadata and cache files locally (nothing when *skip_attachments*)."""
     attachments = []
@@ -489,6 +584,14 @@ class EmailAdapter(BasePlatformAdapter):
         self._authserv_id = (extra.get("authserv_id", "") or _get_secret("EMAIL_AUTHSERV_ID", "")).strip().lower()
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
+        mailbox_key = "\0".join((self._address.strip().lower(), self._imap_host.strip().lower(), str(self._imap_port)))
+        mailbox_id = hashlib.sha256(mailbox_key.encode("utf-8")).hexdigest()[:16]
+        self._auth_retry_state_path = get_hermes_home() / "state" / f"email_auth_retries-{mailbox_id}.json"
+        self._auth_retry_guard_path = self._auth_retry_state_path.with_suffix(".guard")
+        self._auth_retry_uidvalidity = ""
+        self._auth_retry_generation = 0
+        self._pending_auth_retries: set[bytes] = set()
+        self._auth_retry_state_error = ""
         self._poll_task: Optional[asyncio.Task] = None
         self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
         # chat_id (sender email) -> last subject + message-id for threading
@@ -507,6 +610,141 @@ class EmailAdapter(BasePlatformAdapter):
             logger.debug("[Email] Trimmed seen UIDs to %d entries", len(self._seen_uids))
         except (ValueError, TypeError):
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    @staticmethod
+    def _imap_uidvalidity(imap: imaplib.IMAP4) -> str:
+        try:
+            response = imap.response("UIDVALIDITY")
+            if not isinstance(response, tuple) or len(response) < 2:
+                return ""
+            values = response[1]
+            if not isinstance(values, (list, tuple)) or not values:
+                return ""
+            value = values[0]
+            if isinstance(value, bytes):
+                value = value.decode("ascii", "strict")
+            return value.strip() if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit() else ""
+        except Exception:
+            return ""
+
+    def _auth_retry_mailbox_identity(self) -> Dict[str, Any]:
+        return {"address": self._address.strip().lower(), "imap_host": self._imap_host.strip().lower(),
+                "imap_port": self._imap_port}
+
+    def _set_auth_retry_state_error(self, message: str) -> None:
+        self._auth_retry_state_error = message
+        logger.error("[Email] %s", message)
+
+    def _sync_auth_retry_state(self, imap: imaplib.IMAP4) -> None:
+        """Validate paired records before acknowledging mail or taking a historical baseline."""
+        uidvalidity = self._imap_uidvalidity(imap)
+        self._auth_retry_state_error = ""
+        self._pending_auth_retries = set()
+        self._auth_retry_generation = 0
+        self._auth_retry_uidvalidity = ""
+        try:
+            state_exists = self._auth_retry_state_path.exists()
+            guard_exists = self._auth_retry_guard_path.exists()
+        except OSError:
+            self._set_auth_retry_state_error("Cannot inspect authentication retry state safely")
+            return
+        if state_exists != guard_exists:
+            self._set_auth_retry_state_error("Authentication retry state is incomplete; refusing to acknowledge unread mail")
+            return
+        if not uidvalidity:
+            if state_exists:
+                self._set_auth_retry_state_error("Cannot validate retained email retry state without IMAP UIDVALIDITY; refusing to acknowledge unread mail")
+            return
+        self._auth_retry_uidvalidity = uidvalidity
+        if not state_exists:
+            return
+        try:
+            with self._auth_retry_guard_path.open(encoding="utf-8") as handle:
+                guard = json.load(handle)
+            with self._auth_retry_state_path.open(encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            self._set_auth_retry_state_error("Cannot load authentication retry state safely")
+            return
+        identity = self._auth_retry_mailbox_identity()
+        if not isinstance(guard, dict) or guard.get("mailbox") != identity:
+            self._set_auth_retry_state_error("Authentication retry guard belongs to a different mailbox; refusing to acknowledge unread mail")
+            return
+        if not isinstance(state, dict) or state.get("mailbox") != identity:
+            self._set_auth_retry_state_error("Authentication retry state belongs to a different mailbox; refusing to acknowledge unread mail")
+            return
+        generation = guard.get("generation")
+        if (type(guard.get("version")) is not int or guard["version"] != 1
+                or type(state.get("version")) is not int or state["version"] != 3
+                or type(generation) is not int or generation < 1
+                or type(state.get("generation")) is not int or generation != state["generation"]):
+            self._set_auth_retry_state_error("Authentication retry state transaction is inconsistent; refusing to acknowledge unread mail")
+            return
+        if state.get("uidvalidity") != uidvalidity:
+            self._set_auth_retry_state_error("Authentication retry state UIDVALIDITY changed; refusing to acknowledge unread mail")
+            return
+        pending = state.get("pending")
+        if not isinstance(pending, list) or any(not isinstance(uid, str) or not uid.isascii() or not uid.isdigit() for uid in pending):
+            self._set_auth_retry_state_error("Authentication retry state has invalid pending UIDs")
+            return
+        self._auth_retry_generation = generation
+        self._pending_auth_retries = {uid.encode("ascii") for uid in pending}
+
+    def _save_auth_retry_state(self) -> bool:
+        if not self._auth_retry_uidvalidity:
+            self._set_auth_retry_state_error("Cannot persist authentication retry state without IMAP UIDVALIDITY")
+            return False
+        generation = self._auth_retry_generation + 1
+        identity = self._auth_retry_mailbox_identity()
+        try:
+            # Guard first: a crash between writes creates a refused generation mismatch.
+            atomic_json_write(self._auth_retry_guard_path,
+                              {"version": 1, "mailbox": identity, "generation": generation}, mode=0o600, fsync_dir=True)
+            atomic_json_write(self._auth_retry_state_path,
+                              {"version": 3, "mailbox": identity, "generation": generation,
+                               "uidvalidity": self._auth_retry_uidvalidity,
+                               "pending": [uid.decode("ascii") for uid in sorted(self._pending_auth_retries)]},
+                              mode=0o600, fsync_dir=True)
+        except OSError:
+            self._set_auth_retry_state_error("Could not persist authentication retry state safely")
+            return False
+        self._auth_retry_generation = generation
+        return True
+
+    def _initialize_auth_retry_state(self) -> bool:
+        if self._auth_retry_state_error:
+            return False
+        # Preserve target behavior for servers omitting UIDVALIDITY with no existing state;
+        # retaining a temporary failure on such a server still fails closed.
+        if not self._auth_retry_uidvalidity:
+            return True
+        try:
+            if self._auth_retry_state_path.exists() and self._auth_retry_guard_path.exists():
+                return True
+        except OSError:
+            self._set_auth_retry_state_error("Cannot inspect authentication retry state safely")
+            return False
+        return self._save_auth_retry_state()
+
+    def _retain_for_auth_retry(self, uid: bytes) -> bool:
+        self._pending_auth_retries.add(uid)
+        return self._save_auth_retry_state()
+
+    def _clear_auth_retry(self, uid: bytes) -> bool:
+        if uid not in self._pending_auth_retries:
+            return True
+        self._pending_auth_retries.remove(uid)
+        return self._save_auth_retry_state()
+
+    def _mark_message_seen(self, imap: imaplib.IMAP4, uid: bytes) -> bool:
+        """A temporary candidate is never dispatched or remembered before successful STORE."""
+        status, _data = imap.uid("store", uid.decode("ascii"), "+FLAGS.SILENT", r"(\Seen)")
+        if status != "OK":
+            logger.error("[Email] Could not mark UID %s as seen; deferring dispatch", uid)
+            return False
+        self._seen_uids.add(uid)
+        self._trim_seen_uids()
+        return True
 
     def _connect_imap(self) -> imaplib.IMAP4:
         """Create an IMAP connection using implicit TLS, STARTTLS, or plaintext."""
@@ -560,15 +798,22 @@ class EmailAdapter(BasePlatformAdapter):
         """Connection test + seen-UID baseline. Sets a fatal error and returns False on failure."""
         try:
             with self._inbox() as imap:
+                self._sync_auth_retry_state(imap)
+                if not self._initialize_auth_retry_state():
+                    self._set_fatal_error("email_auth_retry_state_error",
+                                          "Authentication retry state is unsafe; refusing mailbox baseline: " + self._auth_retry_state_error,
+                                          retryable=False)
+                    return False
                 snapshot = self._seen_uids_snapshot.get(self._address)
                 if is_reconnect and snapshot is not None:
                     # Same-process reconnect: restore the previous adapter's baseline so mail that
                     # arrived during the outage stays eligible for the next poll.
-                    self._seen_uids = set(snapshot)
+                    self._seen_uids = set(snapshot) - self._pending_auth_retries
                     passed = "[Email] IMAP reconnect test passed. Restored %d seen UIDs; messages received during the outage will be processed."
                 else:  # first connect (or no snapshot): mark all existing messages seen
                     status, data = imap.uid("search", None, "ALL")
-                    self._seen_uids.update(data[0].split() if status == "OK" and data and data[0] else ())
+                    self._seen_uids.update(uid for uid in (data[0].split() if status == "OK" and data and data[0] else ())
+                                           if uid not in self._pending_auth_retries)
                     passed = "[Email] IMAP connection test passed. %d existing messages skipped."
                 self._trim_seen_uids()
                 logger.info(passed, len(self._seen_uids))
@@ -642,7 +887,7 @@ class EmailAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         async def authorize_on_loop(msg_data: Dict[str, Any]) -> bool:
-            return self._sender_accepted(msg_data["sender_addr"], msg_data)
+            return self._sender_accepted(msg_data["sender_addr"], msg_data, for_auth_retry=True)
 
         def gate(candidate: Dict[str, Any]) -> bool:
             # Authorization reads profile-scoped policy and pairing state on the adapter's event loop;
@@ -678,6 +923,10 @@ class EmailAdapter(BasePlatformAdapter):
         results = []
         try:
             with self._inbox() as imap:
+                self._sync_auth_retry_state(imap)
+                if not self._initialize_auth_retry_state():
+                    self._last_fetch_failed, self._last_fetch_error = True, self._auth_retry_state_error
+                    return results
                 status, data = imap.uid("search", None, "UNSEEN")
                 for uid in (data[0].split() if status == "OK" and data and data[0] else []):
                     if uid in self._seen_uids:
@@ -699,9 +948,54 @@ class EmailAdapter(BasePlatformAdapter):
                     if not accepted:
                         self._mark_uid_consumed(imap, uid)
                         continue
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    temporary = (self._require_authenticated_sender and not candidate["sender_authenticated"]
+                                 and candidate["temporary_aligned_dkim_failure"])
+                    # Keep the newer ordinary RFC822 path; only an authenticated-policy
+                    # retry candidate needs non-acknowledging raw-wire PEEK re-verification.
+                    status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])" if temporary else "(RFC822)")
                     if status != "OK":
                         continue  # transient per-UID refusal: leave unseen so the next poll retries
+                    if temporary:
+                        raw_email = _imap_payload(msg_data)
+                        if raw_email is None:
+                            continue
+                        wire_meta = self._message_metadata(uid, BytesHeaderParser().parsebytes(raw_email))
+                        if (wire_meta is None or wire_meta["sender_addr"] != candidate["sender_addr"]
+                                or not wire_meta["temporary_aligned_dkim_failure"]):
+                            if self._mark_message_seen(imap, uid):
+                                self._clear_auth_retry(uid)
+                            continue
+                        verified, retryable, reason = _verify_temporary_dkim(bytes(raw_email), wire_meta["sender_addr"])
+                        if not verified:
+                            if retryable:
+                                if not self._retain_for_auth_retry(uid):
+                                    self._last_fetch_failed, self._last_fetch_error = True, self._auth_retry_state_error
+                                    return results
+                                continue
+                            if self._mark_message_seen(imap, uid):
+                                self._clear_auth_retry(uid)
+                            continue
+                        wire_meta.update(sender_authenticated=True, auth_reason=reason)
+                        # Authorization/pairing is checked again on the scoped loop, now
+                        # with a real cryptographic verdict, before body/attachment parsing.
+                        if not preauthorize(wire_meta):
+                            if self._mark_message_seen(imap, uid):
+                                self._clear_auth_retry(uid)
+                            continue
+                        if not self._mark_message_seen(imap, uid):
+                            continue
+                        if not self._clear_auth_retry(uid):
+                            self._last_fetch_failed, self._last_fetch_error = True, self._auth_retry_state_error
+                            return results
+                        try:
+                            parsed = self._parse_fetched_message(uid, raw_email,
+                                                                sender_authenticated=True, auth_reason=reason)
+                        except Exception as parse_exc:
+                            logger.error("[Email] Failed to process message UID %s, skipping: %s", uid, parse_exc)
+                            continue
+                        if parsed is not None:
+                            results.append(parsed)
+                        continue
                     # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
                     # but NOT before the fetch: a connection failure must leave the rest of the batch eligible for the next poll.
                     self._seen_uids.add(uid)
@@ -742,17 +1036,22 @@ class EmailAdapter(BasePlatformAdapter):
         sender_authenticated, auth_reason = _verify_sender_authentication(msg, sender_addr, authserv_id=self._authserv_id)
         return {"uid": uid, "sender_addr": sender_addr, "sender_name": sender_name, "subject": subject,
                 "message_id": msg.get("Message-ID", ""), "in_reply_to": msg.get("In-Reply-To", ""),
-                "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason}
+                "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason,
+                "temporary_aligned_dkim_failure": _has_temporary_aligned_dkim_failure(msg, sender_addr, authserv_id=self._authserv_id)}
 
     def _parse_fetched_headers(self, uid: bytes, raw_headers: "bytes | bytearray") -> Optional[Dict[str, Any]]:
         """Parse the bounded IMAP header preflight without constructing a MIME tree."""
         return self._message_metadata(uid, BytesHeaderParser().parsebytes(bytes(raw_headers)))
 
-    def _parse_fetched_message(self, uid: bytes, raw_email: "bytes | bytearray") -> Optional[Dict[str, Any]]:
+    def _parse_fetched_message(self, uid: bytes, raw_email: "bytes | bytearray", *,
+                               sender_authenticated: Optional[bool] = None,
+                               auth_reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Parse an authorized RFC822 payload into a dispatchable dict."""
         msg = email_lib.message_from_bytes(raw_email)
         if (metadata := self._message_metadata(uid, msg)) is None:
             return None
+        if sender_authenticated is not None and auth_reason is not None:
+            metadata.update(sender_authenticated=sender_authenticated, auth_reason=auth_reason)
         metadata.update(body=_extract_text_body(msg),
                         attachments=_extract_attachments(msg, skip_attachments=self._skip_attachments))
         return metadata
@@ -771,7 +1070,7 @@ class EmailAdapter(BasePlatformAdapter):
         behavior = (self.config.extra or {}).get("unauthorized_dm_behavior")
         return isinstance(behavior, str) and behavior.strip().lower() in {"pair", "decline"}
 
-    def _sender_accepted(self, sender_addr: str, msg_data: Dict[str, Any]) -> bool:
+    def _sender_accepted(self, sender_addr: str, msg_data: Dict[str, Any], *, for_auth_retry: bool = False) -> bool:
         """Pre-dispatch sender gate: self, automated, authorization, From: authentication."""
         if sender_addr == self._address.lower():
             return False
@@ -809,6 +1108,10 @@ class EmailAdapter(BasePlatformAdapter):
         # Warn only where the operator can act: a known misconfiguration, or a listed contact's own mail failing.
         # Forged stranger mail (open access grants everyone) stays at debug.
         if self._require_authenticated_sender and not msg_data.get("sender_authenticated", False):
+            # This permits only a raw PEEK for independent verification after ALL
+            # target authorization/pairing checks above. Dispatch never sets this flag.
+            if for_auth_retry and msg_data.get("temporary_aligned_dkim_failure", False):
+                return True
             auth_reason = msg_data.get("auth_reason", "no verdict")
             hint = _DROP_HINTS.get(auth_reason, "")
             if is_listed or (granted and hint):

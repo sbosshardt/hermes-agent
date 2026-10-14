@@ -91,14 +91,14 @@ def _content_with_turn_override(msg: Dict, content: Any, override: Any) -> Any:
     return override
 
 
-def durable_user_row_content(agent, msg: Dict, content: Any, api_content: Any) -> Tuple[Any, Any]:
+def durable_user_row_content(agent, msg: Dict, content: Any, api_content: Any, *,
+                             infer_api_content: bool = True) -> Tuple[Any, Any]:
     """``(content, api_content)`` as the current turn's user row is written: the persist override is the
-    clean transcript, the live content is what the wire sent — so when they differ and nothing else was
-    injected, the live bytes ARE the sidecar. Shared by the flush and the turn-start stamp so the stamp
-    matches the row the flush wrote."""
+    clean transcript. Non-Codex callers may infer differing live bytes; current Codex strings disable
+    inference and retain only an exact ACK stamp. Shared by flush and stamp to match the written row."""
     override = getattr(agent, "_persist_user_message_override", None)
     if _override_replaces_content(msg, content, override):
-        if api_content is None and isinstance(content, str) and content != override:
+        if infer_api_content and api_content is None and isinstance(content, str) and content != override:
             api_content = content
         content = _content_with_turn_override(msg, content, override)
     return content, api_content
@@ -208,16 +208,32 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
     timestamp = msg.get("timestamp")
+    current_codex_string = (is_current_turn_user and role == "user" and isinstance(content, str)
+                            and getattr(agent, "api_mode", None) == "codex_app_server")
+    display_metadata = msg.get("display_metadata")
     if is_current_turn_user and role == "user":
-        content, api_content = durable_user_row_content(agent, msg, content, api_content)
+        content, api_content = durable_user_row_content(
+            agent, msg, content, api_content, infer_api_content=not current_codex_string,
+        )
         ov_timestamp = getattr(agent, "_persist_user_message_timestamp", None)
         timestamp = timestamp if ov_timestamp is None else ov_timestamp
-    if api_content == content:
+    if current_codex_string:
+        from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
+        # Neither raw/override nor sanitizer divergence proves what Codex accepted, even after ACK.
+        verified = (msg.get("_codex_input_accepted") is True and isinstance(content, str)
+                    and isinstance(api_content, str) and isinstance(display_metadata, dict)
+                    and display_metadata.get(SIDECAR_PROVENANCE_KEY) == sidecar_provenance(content, api_content))
+        if not verified or (isinstance(content, str) and api_content == sanitize_context(content).strip()):
+            api_content = None
+            if isinstance(display_metadata, dict):
+                display_metadata = dict(display_metadata)
+                display_metadata.pop(SIDECAR_PROVENANCE_KEY, None)
+    elif api_content == content:
         api_content = None
     # get_messages_as_conversation replays rows through sanitize_context().strip(); capture the sent bytes
     # when they would differ (compared in wire form).
     if (
-        api_content is None and role in ("user", "assistant") and isinstance(content, str) and content
+        not current_codex_string and api_content is None and role in ("user", "assistant") and isinstance(content, str) and content
         and sanitize_context(content).strip() != content.strip()
     ):
         api_content = content
@@ -231,7 +247,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
-        "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
+        "display_kind": _summary_display_kind(msg), "display_metadata": display_metadata,
         # Load-bearing for restart drain-window recovery dedup.
         "platform_message_id": msg.get("platform_message_id") or msg.get("message_id"),
         "observed": bool(msg.get("observed")),

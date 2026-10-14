@@ -1076,55 +1076,41 @@ class SessionMessagesMixin:
             self._message_columns_cache = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
         return self._message_columns_cache
 
-    def set_latest_user_api_content(self, session_id: str, content: Any, api_content: str) -> int:
-        """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row (0/1 rows). Preflight compaction
-        inserts that row BEFORE the sidecar exists and the later persist identity-skips compacted dicts;
-        without this a reload reopens the prompt-cache divergence. ``content`` match guards a racing rewrite.
-
-        POSITIONAL, and only safe when the caller already knows the newest
-        active user row IS the message it stamped. The content match is NOT
-        sufficient on its own: repeated identical user turns ("ok", "y",
-        "continue") make an OLDER row compare equal, so calling this before
-        the current turn's row exists overwrites the previous turn's sidecar
-        with this turn's bytes — durable wrong-bytes replay, a worse cache
-        break than the missing sidecar. When the caller holds the durable row
-        id (``_row_id``, synced onto the live dict by
-        ``sync_flushed_message_markers`` and stamped by
-        :meth:`_insert_message_rows`), use :meth:`set_message_api_content`
-        instead — it addresses the exact row and cannot land on a neighbour.
+    def set_latest_user_api_content(self, session_id: str, content: Any, api_content: Optional[str], *,
+                                    display_metadata: Any = None) -> int:
+        """Positional backfill (0/1): ONLY after verified in-place compaction made this the newest user.
+        Repeated equal text is not identity. A supplied row id must use set_message_api_content instead.
+        Merge/clear provenance atomically with wire bytes, never overwrite concurrent durable metadata.
         """
+        if not session_id:
+            return 0
+        from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
+        patch = {SIDECAR_PROVENANCE_KEY: None, **(display_metadata if isinstance(display_metadata, dict) else {})}
         return self._write_rowcount(
-            "UPDATE messages SET api_content = ? WHERE id = (SELECT id FROM messages "
+            "UPDATE messages SET api_content = ?, display_metadata = "
+            "json_patch(COALESCE(display_metadata, '{}'), ?) WHERE id = (SELECT id FROM messages "
             "WHERE session_id = ? AND role = 'user' AND active = 1 ORDER BY id DESC LIMIT 1"
             ") AND content IS ?",
-            (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
+            (_scrub_surrogates(api_content), self._encode_display_metadata(patch),
+             session_id, self._encode_content(content)))
 
     def set_message_api_content(
-        self, session_id: str, row_id: int, content: Any, api_content: str
+        self, session_id: str, row_id: int, content: Any, api_content: Optional[str], *,
+        display_metadata: Any = None,
     ) -> int:
-        """Backfill the ``api_content`` sidecar onto ONE known durable row.
-
-        Row-addressed counterpart to :meth:`set_latest_user_api_content`: the
-        caller passes the ``_row_id`` the write path stamped on the live
-        message dict, so the update cannot drift onto a neighbouring row that
-        merely carries the same text.
-
-        Used by the turn prologue whenever the current turn's user row was
-        already materialized before the sidecar could be composed (in-place
-        preflight compaction, a close/early flush that raced the prologue).
-        The crash persist then marker-skips that message, so this is the only
-        way the stamped bytes reach the store.
-
-        ``active = 1`` and the ``content`` match stay as defensive guards: a
-        row the compaction archived, or one a racing rewrite changed, is left
-        untouched.
+        """Backfill ONE owning session's exact active user row (0/1), guarded by id and raw content.
+        Atomic JSON Merge Patch preserves reactions; null removes old provenance on clean retry.
         """
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
+        from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
+        patch = {SIDECAR_PROVENANCE_KEY: None, **(display_metadata if isinstance(display_metadata, dict) else {})}
         return self._write_rowcount(
-            "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
+            "UPDATE messages SET api_content = ?, display_metadata = "
+            "json_patch(COALESCE(display_metadata, '{}'), ?) WHERE id = ? AND session_id = ? "
             "AND role = 'user' AND active = 1 AND content IS ?",
-            (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
+            (_scrub_surrogates(api_content), self._encode_display_metadata(patch),
+             row_id, session_id, self._encode_content(content)))
 
     def set_user_message_content(self, session_id: str, row_id: int, content: Any) -> int:
         """Rewrite the content of ONE known active user row. Used when a user turn was written at submit
@@ -1571,6 +1557,7 @@ class SessionMessagesMixin:
         from hermes_state import _strip_background_review_harness, _strip_stale_tool_call_markers
         # Runtime import avoids the transcript_repair -> hermes_state_messages module cycle.
         from agent.transcript_repair import transcript_row_snapshot
+        from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
         # Only the unaddressed live replay gets the digest: row-addressed loaders (include_row_ids) keep the
         # legacy resumed-dict path, whose rewrite never re-writes columns the projection does not decode
         # (a CAS-match rewrite of a resumed row would otherwise null token_count).
@@ -1582,7 +1569,13 @@ class SessionMessagesMixin:
         # build's) needs the index, so rows this build wrote never pay for it. Indexed in order: same shadowing.
         unindexed_tool_owners: List[Dict[str, Any]] = []
         for row in rows:
-            content = self._loaded_view_content(row["role"], self._decode_content(row["content"]))
+            raw_content = self._decode_content(row["content"])
+            metadata = self._decode_display_metadata(row["display_metadata"])
+            # Authenticate RAW bytes first: distinct raw rows may sanitize to the same visible view.
+            verified_sidecar = (row["role"] == "user" and isinstance(raw_content, str)
+                                and isinstance(row["api_content"], str) and isinstance(metadata, dict)
+                                and metadata.get(SIDECAR_PROVENANCE_KEY) == sidecar_provenance(raw_content, row["api_content"]))
+            content = self._loaded_view_content(row["role"], raw_content)
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).
             msg = {"role": row["role"], "content": content, _DB_PERSISTED_MARKER_KEY: True}
@@ -1599,8 +1592,13 @@ class SessionMessagesMixin:
             # (ACP, gateway, CLI, TUI, compression adoption), never opt-in like ``_row_id``.
             _restore_identity_columns(row, msg)
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
-            if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
-                msg["display_metadata"] = decoded
+            if metadata is not None:
+                if row["role"] == "user" and SIDECAR_PROVENANCE_KEY in metadata:
+                    metadata = dict(metadata)
+                    metadata.pop(SIDECAR_PROVENANCE_KEY, None)
+                    if verified_sidecar and isinstance(content, str):
+                        metadata[SIDECAR_PROVENANCE_KEY] = sidecar_provenance(content, row["api_content"])
+                msg["display_metadata"] = metadata
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(

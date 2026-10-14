@@ -718,8 +718,102 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
     return usage_result
 
 
-def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: List[Dict[str, Any]],
-                              effective_task_id: str, should_review_memory: bool = False) -> Dict[str, Any]:
+def _codex_current_input(agent, user_message, messages, current_turn_user_idx, ext_prefetch_cache, plugin_user_context):
+    """Compose only current strings; multipart context is already a durable staged part."""
+    from agent.turn_context import _clear_codex_sidecar_stamp, compose_user_api_content
+    from agent.session_persistence import _persist_lock
+    idx = len(messages) - 1 if current_turn_user_idx is None else current_turn_user_idx
+    row = messages[idx] if 0 <= idx < len(messages) else None
+    current_string = (isinstance(user_message, str) and isinstance(row, dict)
+                      and row.get("role") == "user" and isinstance(row.get("content"), str))
+    user_input = compose_user_api_content(user_message, ext_prefetch_cache, plugin_user_context)
+    if user_input is None:
+        user_input = user_message
+    if (isinstance(user_message, list) and isinstance(row, dict)
+            and row.get("role") == "user" and isinstance(row.get("content"), list)):
+        user_input = row["content"]  # preserve images and append the selected context only once
+    if current_string:
+        with _persist_lock(agent):
+            _clear_codex_sidecar_stamp(row)
+    return user_input, idx, current_string
+
+
+def _codex_string_input_accepted(turn, expected_submitted) -> bool:
+    """Literal ACK and exact submitted bytes, never a plausible suffix or attempted input."""
+    turn_id = getattr(turn, "turn_id", None)
+    submitted = getattr(turn, "submitted_user_text", None)
+    return (getattr(turn, "input_accepted", False) is True
+            and isinstance(turn_id, str) and bool(turn_id.strip())
+            and isinstance(submitted, str) and isinstance(expected_submitted, str)
+            and submitted == expected_submitted)
+
+
+def _capture_codex_recall_append(agent, *, selected_recall, composed_input, user_message,
+                                 plugin_user_context, history_seed, seed_pending):
+    """Request-local fresh recall and exact wire expectation; the caller guards this optional work."""
+    observation = getattr(agent, "_last_auto_recall_observation", None)
+    context = getattr(agent, "_auto_recall_context", None)
+    if not isinstance(observation, dict):
+        return None
+    if (observation.get("attempted") is not True or observation.get("success") is not True
+            or observation.get("append_logged")):
+        return None
+    if (not isinstance(selected_recall, str) or not isinstance(context, str)
+            or selected_recall != context):
+        return None
+    if not isinstance(user_message, str) or not isinstance(composed_input, str):
+        return None
+    from agent.memory_manager import sanitize_context
+    from agent.turn_context import compose_user_api_content
+    # The shared block builder can emit a fence after sanitization removes all content.
+    if not sanitize_context(selected_recall).strip():
+        return None
+    expected_current = compose_user_api_content(user_message, selected_recall, plugin_user_context)
+    if not isinstance(expected_current, str) or composed_input != expected_current:
+        return None
+    expected_submitted = expected_current
+    if seed_pending:
+        if not isinstance(history_seed, str) or not history_seed.strip():
+            return None
+        expected_submitted = history_seed + "\n\n[CURRENT USER TURN]\n" + expected_current
+    return observation, context, expected_submitted
+
+
+def _observe_codex_recall_append(agent, turn, *, request_snapshot) -> None:
+    """Metadata-only exact-ACK observation, never recovery authority; guarded by the caller."""
+    observation, context, expected_submitted = request_snapshot
+    if getattr(agent, "_last_auto_recall_observation", None) is not observation:
+        return
+    if (observation.get("attempted") is not True or observation.get("success") is not True
+            or observation.get("append_logged")):
+        return
+    current_context = getattr(agent, "_auto_recall_context", None)
+    if not isinstance(current_context, str) or current_context != context:
+        return
+    turn_id = getattr(turn, "turn_id", None)
+    submitted = getattr(turn, "submitted_user_text", None)
+    if (getattr(turn, "input_accepted", False) is not True
+            or not isinstance(turn_id, str) or not turn_id.strip()
+            or not isinstance(submitted, str)):
+        return
+    appended = _codex_string_input_accepted(turn, expected_submitted)
+    observation["append_logged"] = True
+    observation["memory_context_appended"] = appended
+    if appended:
+        observation["memory_context_chars"] = len(submitted)
+        logger.info("Auto-recall memory-context appended: session=%s chars=%d",
+                    getattr(agent, "session_id", None) or "", len(submitted))
+    else:
+        observation["append_failure_reason"] = "input_mismatch"
+        logger.info("Auto-recall memory-context append skipped: session=%s reason=input_mismatch",
+                    getattr(agent, "session_id", None) or "")
+
+
+def run_codex_app_server_turn(agent, *, user_message: Any, original_user_message: Any, messages: List[Dict[str, Any]],
+                              effective_task_id: str, should_review_memory: bool = False,
+                              ext_prefetch_cache: str = "", plugin_user_context: str = "",
+                              preflight_compressed: bool = False,
+                              current_turn_user_idx: int | None = None) -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
@@ -729,11 +823,29 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent, messages)
+    codex_user_input, current_idx, current_string = _codex_current_input(
+        agent, user_message, messages, current_turn_user_idx, ext_prefetch_cache, plugin_user_context,
+    )
     try:
         _start_codex_thread(agent)
+        session = agent._codex_session
+        seed_pending = getattr(session, "_history_seed_pending", False) is True
+        seed = getattr(session, "_history_seed", None)
+        expected_submitted = codex_user_input
+        if seed_pending:
+            expected_submitted = (seed + "\n\n[CURRENT USER TURN]\n" + codex_user_input
+                                  if isinstance(seed, str) and isinstance(codex_user_input, str) else None)
+        recall_snapshot = None
+        if current_string:
+            with suppress(Exception):
+                recall_snapshot = _capture_codex_recall_append(
+                    agent, selected_recall=ext_prefetch_cache, composed_input=codex_user_input,
+                    user_message=user_message, plugin_user_context=plugin_user_context,
+                    history_seed=seed, seed_pending=seed_pending,
+                )
         wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
-        turn = agent._codex_session.run_turn(
-            user_input=user_message,
+        turn = session.run_turn(
+            user_input=codex_user_input,
             model=wire_model, reasoning_effort=_codex_turn_effort(agent, wire_model),
             service_tier=_codex_turn_service_tier(agent))
     except Exception as exc:
@@ -742,6 +854,16 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         return _turn_result(
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
             final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
+        )
+    if recall_snapshot is not None:
+        with suppress(Exception):
+            _observe_codex_recall_append(agent, turn, request_snapshot=recall_snapshot)
+    if current_string and _codex_string_input_accepted(turn, expected_submitted):
+        # Only the verified current suffix belongs to this row; the pending seed is never a sidecar.
+        from agent.turn_context import _stamp_api_content_sidecar
+        _stamp_api_content_sidecar(
+            agent, messages, current_idx, "", "", preflight_compressed=preflight_compressed,
+            wire_content=codex_user_input,
         )
     interrupt = _consume_user_interrupt(agent, turn.interrupted)
     # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool

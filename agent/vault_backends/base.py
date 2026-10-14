@@ -37,6 +37,10 @@ class LoginBackend(ABC):
     def is_unlocked(self) -> bool:
         return True
 
+    def try_unattended_unlock(self) -> bool:
+        """Opt-in manager-owned unlock for dedicated non-interactive accounts."""
+        return False
+
     @abstractmethod
     def list_items(self) -> List[VaultItemMeta]:
         """Metadata only. Locked external backends return [] (the agent sees a lock hint instead)."""

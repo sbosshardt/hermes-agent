@@ -159,8 +159,59 @@ def test_fallback_exhaustion_keeps_stale_streak():
 
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_new_user_turn_reaches_provider_after_latched_streak(monkeypatch, streaming):
+    """A fresh message must reach the provider, even after the prior turn hit its limit."""
+    from agent import conversation_loop
+    from agent.chat_completion_helpers import _check_stale_giveup
+
+    monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "5")
+    agent = _make_fallback_agent(fallback_model=[])
+    agent._consecutive_stale_streams = 5
+    agent.streaming = streaming
+    response = object()
+    agent.client.chat.completions.create.return_value = response
+
+    def provider_turn(current_agent, user_message, **kwargs):
+        _check_stale_giveup(current_agent)
+        reply = current_agent.client.chat.completions.create(stream=current_agent.streaming)
+        assert reply is response
+        return {"completed": True, "messages": [], "final_response": "recovered"}
+
+    monkeypatch.setattr(conversation_loop, "_run_conversation_turn", provider_turn)
+    monkeypatch.setattr("agent.turn_context.export_current_turn_boundary", lambda a, r, u: r)
+    for _ in range(2):
+        agent._consecutive_stale_streams = 5
+        agent.client.chat.completions.create.reset_mock()
+        result = conversation_loop.run_conversation(agent, "Try again")
+        assert result["final_response"] == "recovered"
+        agent.client.chat.completions.create.assert_called_once_with(stream=streaming)
+        assert agent._consecutive_stale_streams == 0
+
+
 class TestNonStreamingSibling:
     """interruptible_api_call carries the same breaker (#58962)."""
+
+    def test_new_turn_reset_does_not_disable_same_turn_giveup(self, monkeypatch):
+        from agent import conversation_loop
+        from agent.chat_completion_helpers import _bump_stale_streak, _check_stale_giveup
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "5")
+        agent = _make_fallback_agent(fallback_model=[])
+        agent._consecutive_stale_streams = 5
+
+        def stale_turn(current_agent, user_message, **kwargs):
+            assert current_agent._consecutive_stale_streams == 0
+            for _ in range(5):
+                _bump_stale_streak(current_agent)
+            _check_stale_giveup(current_agent)
+
+        monkeypatch.setattr(conversation_loop, "_run_conversation_turn", stale_turn)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="unresponsive"):
+                conversation_loop.run_conversation(agent, "Retry")
+            assert agent._consecutive_stale_streams == 5
+            agent.client.chat.completions.create.assert_not_called()
 
     def test_non_streaming_short_circuits_at_threshold(self, monkeypatch):
         monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")

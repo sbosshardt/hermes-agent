@@ -992,14 +992,88 @@ class SessionDB(
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
+    @contextmanager
+    def _write_lock(self, timeout_s: float) -> Iterator[None]:
+        """Bound telemetry's local admission without changing critical writers."""
+        if not self._lock.acquire(timeout=max(0.0, timeout_s)):
+            raise TimeoutError("state.db local write lock unavailable for best-effort telemetry")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def _nonblocking_sqlite_writer(self, conn: sqlite3.Connection) -> Iterator[None]:
+        """Caller owns the writer mutex through busy-handler restoration."""
+        old_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            conn.execute("PRAGMA busy_timeout=0")
+            yield
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={int(old_timeout)}")
+
+    def _raise_if_telemetry_generation_changed(self) -> None:
+        """Lock-owned refusal only; critical writes/close still own recovery."""
+        if self._db_corrupt or storage_state(self.db_path) == STORAGE_CORRUPT:
+            raise StateDbCorruptError("state.db corrupt before best-effort telemetry write")
+        if self._db_replaced or self._db_file_was_replaced():
+            raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
+        if self._db_wal_generation_lost or self._wal_generation_was_lost():
+            raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
+
+    def _execute_best_effort_write(
+        self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float],
+        lock_timeout_s: Optional[float],
+    ) -> T:
+        """One synchronous attempt, with a shared <=0.5s admission/BUSY budget.
+
+        No replay (even before the callback), reopen, quarantine, forensic
+        capture, checkpoint or FTS work. SQLite BUSY waits are disabled, so a
+        successful local admission cannot inherit the critical writer's timeout.
+        This bounds lock contention, not arbitrary callback or filesystem I/O.
+        """
+        budget = 0.5 if patience_s is None else min(0.5, max(0.0, patience_s))
+        deadline = time.monotonic() + budget
+        admission = budget if lock_timeout_s is None else min(budget, max(0.0, lock_timeout_s))
+        with self._write_lock(min(admission, max(0.0, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("state.db best-effort telemetry budget exhausted")
+            if self.read_only or self._conn is None:
+                raise TimeoutError("state.db writer unavailable for best-effort telemetry")
+            self._raise_if_telemetry_generation_changed()
+            conn = self._conn
+            with self._nonblocking_sqlite_writer(conn):
+                if conn.in_transaction:
+                    raise sqlite3.ProgrammingError("best-effort telemetry requires an idle writer")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("state.db best-effort telemetry budget exhausted")
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("state.db best-effort telemetry budget exhausted")
+                    result = fn(conn)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("state.db best-effort telemetry budget exhausted")
+                    conn.commit()
+                    return result
+                except BaseException:
+                    with suppress(Exception):
+                        conn.rollback()
+                    raise
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        *, lock_timeout_s: Optional[float] = None, best_effort: bool = False,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
         immediately; on locked/busy the Python lock is released, a jitter slept,
-        and the WHOLE callback retried — *fn* must stay idempotent under retry."""
+        and the WHOLE callback retried — *fn* must stay idempotent under retry.
+        ``best_effort`` opts into a separate bounded, no-recovery attempt;
+        ``lock_timeout_s`` limits its local admission within the same budget."""
+        if best_effort:
+            return self._execute_best_effort_write(fn, patience_s, lock_timeout_s)
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s

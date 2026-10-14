@@ -35,6 +35,23 @@ from agent.turn_author import parse_turn_author
 logger = logging.getLogger(__name__)
 
 
+# The native chat builder removes underscore-prefixed fields before middleware.
+# This request-local transit field survives that copy, not the final request.
+_AUTO_RECALL_CURRENT_KEY = "hermes_auto_recall_current_turn_provenance"
+_AUTO_RECALL_PRIVATE_KEYS = frozenset({
+    _AUTO_RECALL_CURRENT_KEY, "_auto_recall_current_turn_provenance",
+})
+
+
+@dataclass(frozen=True)
+class _ChatAutoRecallProvenance:
+    marker: str
+    expected_content: str
+    selected_context: str
+    observation: Dict[str, Any]
+    position: int
+
+
 def _str_attr(agent: Any, name: str) -> str:
     """``getattr(agent, name, "") or ""`` — route facts read off partial agents/doubles."""
     return getattr(agent, name, "") or ""
@@ -110,6 +127,8 @@ def compose_multimodal_context_part(
     """The ephemeral context of one turn (memory prefetch + ``pre_llm_call``) as one text
     block; ``None`` when nothing is injected. The string sidecar appends it to ``content``;
     a multimodal (list) turn carries it as a durable text part (#71998)."""
+    ext_prefetch_cache = ext_prefetch_cache if isinstance(ext_prefetch_cache, str) else ""
+    plugin_user_context = plugin_user_context if isinstance(plugin_user_context, str) else ""
     fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
     injections = [part for part in (fenced, plugin_user_context) if part]
     return "\n\n".join(injections) if injections else None
@@ -496,6 +515,7 @@ class TurnContext:
     plugin_user_context: str = ""  # ``pre_llm_call`` context (appended to user message)
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
+    preflight_compressed: bool = False  # actual turn-start compaction, not a stale agent flag
 
 
 def _persist_under_lock(agent: Any, fn, failure_msg: str, pending_cli_message: Any) -> None:
@@ -898,8 +918,12 @@ def _memory_turn_start_and_prefetch(
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
     Returns the prefetch text (``""`` when nothing was injected)."""
+    agent._last_auto_recall_observation = None
+    agent._auto_recall_context = ""
     if not agent._memory_manager:
         return ""
+    if not agent._memory_manager.wait_for_session_boundary():
+        return ""  # do not tick or read a provider still bound to the old session
     _query = _memory_query_text(original_user_message)
     # The author rides along so a provider can attribute THIS turn, not whoever opened the session.
     _author = turn_author if isinstance(turn_author, dict) else {}
@@ -910,9 +934,40 @@ def _memory_turn_start_and_prefetch(
             author_is_bot=bool(_author.get("is_bot")),
         )
     ext_prefetch_cache = ""
-    with suppress(Exception):
-        if not is_trivial_prompt(_query):
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+    if not is_trivial_prompt(_query):
+        started = time.monotonic()
+        failure_reason = ""
+        try:
+            selected = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id)
+            ext_prefetch_cache = selected if isinstance(selected, str) else ""
+        except Exception as exc:
+            failure_reason = type(exc).__name__
+        latency_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
+        success = bool(ext_prefetch_cache.strip())
+        if not success and not failure_reason:
+            # Native managers swallow per-provider errors; an empty selection does
+            # not reveal whether a provider failed or simply found nothing.
+            failure_reason = "empty_result"
+        agent._last_auto_recall_observation = {
+            "mode": "prefetch", "attempted": True, "success": success,
+            "latency_ms": latency_ms, "context_chars": len(ext_prefetch_cache),
+            "failure_reason": failure_reason,
+        }
+        if success:
+            agent._auto_recall_context = ext_prefetch_cache
+        session_db = getattr(agent, "_session_db", None)
+        if session_db is not None and getattr(agent, "session_id", None):
+            try:
+                session_db.update_auto_recall_metrics(
+                    agent.session_id, attempts=1, failures=0 if success else 1,
+                    latency_ms=latency_ms,
+                )
+            except Exception as exc:
+                logger.warning("Auto-recall metrics persistence failed (%s)", type(exc).__name__)
+        logger.info(
+            "Auto-recall prefetch: success=%s latency_ms=%d context_chars=%d failure_reason=%s",
+            success, latency_ms, len(ext_prefetch_cache), failure_reason or "none",
+        )
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
@@ -923,13 +978,98 @@ def _memory_turn_start_and_prefetch(
     return ext_prefetch_cache
 
 
+def _clear_codex_sidecar_stamp(msg: Dict[str, Any]) -> None:
+    """A current attempt cannot inherit a previous attempt's live recovery authority."""
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
+    msg.pop("api_content", None)
+    msg.pop("_codex_input_accepted", None)
+    metadata = msg.get("display_metadata")
+    if isinstance(metadata, dict) and SIDECAR_PROVENANCE_KEY in metadata:
+        metadata = dict(metadata)
+        metadata.pop(SIDECAR_PROVENANCE_KEY, None)
+        msg["display_metadata"] = metadata
+
+
+def _backfill_codex_sidecar(agent, msg, durable_content, api_content, patch, *, in_place: bool) -> bool:
+    """Under the caller's persist lock, either address the exact row or leave a late INSERT pending."""
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    row_id = msg.get("_row_id")
+    has_row_id = "_row_id" in msg
+    if has_row_id and (isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0):
+        return False
+    if db is None:
+        return True
+    if not has_row_id and not in_place:
+        return not msg.get("_db_persisted")  # durable but unaddressed is NOT a late first INSERT
+    try:
+        if has_row_id:
+            updated = db.set_message_api_content(session_id, row_id, durable_content, api_content,
+                                                 display_metadata=patch)
+        else:
+            updated = db.set_latest_user_api_content(session_id, durable_content, api_content,
+                                                     display_metadata=patch)
+        if updated == 1:
+            return True
+        logger.warning("Acknowledged Codex sidecar matched no exact row for session=%s", session_id or "none")
+    except Exception:
+        logger.warning("Acknowledged Codex sidecar backfill failed for session=%s", session_id or "none", exc_info=True)
+    return False  # never fall back from a supplied id to latest
+
+
+def _stamp_acknowledged_codex_sidecar(
+    agent: Any, msg: Dict[str, Any], wire_content: str, *, preflight_compressed: bool,
+) -> None:
+    """Stamp a verified ACK suffix under the same lock as flush/close; fail closed on row mismatch."""
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
+    from agent.memory_manager import sanitize_context
+    from agent.session_persistence import _persist_lock, durable_user_row_content
+    with _persist_lock(agent):
+        _clear_codex_sidecar_stamp(msg)
+        live_content = msg.get("content")
+        if msg.get("role") != "user" or not isinstance(live_content, str):
+            return
+        session_id = getattr(agent, "session_id", None)
+        if msg.get("_submit_row_session_id", session_id) != session_id:
+            return
+        durable_content, _ = durable_user_row_content(
+            agent, msg, live_content, None, infer_api_content=False,
+        )
+        in_place = (preflight_compressed is True
+                    and getattr(agent, "_last_compaction_in_place", False) is True)
+        db = getattr(agent, "_session_db", None)
+        if db is not None and in_place:
+            # archive_and_compact writes the live copy, not the normal flush's clean override.
+            durable_content = live_content
+        if not isinstance(durable_content, str):
+            return
+        api_content = None if wire_content == sanitize_context(durable_content).strip() else wire_content
+        marker = sidecar_provenance(durable_content, api_content) if api_content is not None else None
+        patch = {SIDECAR_PROVENANCE_KEY: marker}
+        if not _backfill_codex_sidecar(agent, msg, durable_content, api_content, patch, in_place=in_place):
+            return
+        # No durable row yet: the later first INSERT must carry precisely this acknowledged pair.
+        msg["_codex_input_accepted"] = True
+        if api_content is not None:
+            msg["api_content"] = api_content
+            metadata = msg.get("display_metadata")
+            msg["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}),
+                                       SIDECAR_PROVENANCE_KEY: marker}
+
+
 def _stamp_api_content_sidecar(
     agent: Any, messages: List[Any], current_turn_user_idx: int, ext_prefetch_cache: str,
-    plugin_user_context: str, *, preflight_compressed: bool,
+    plugin_user_context: str, *, preflight_compressed: bool, wire_content: Optional[str] = None,
 ) -> None:
     """api_content sidecar — persist what you send: injected context lives only in the
     API copy, so stamp the exact sent bytes on the live dict for replay."""
     _turn_user_msg = messages[current_turn_user_idx]
+    if wire_content is not None:
+        if isinstance(wire_content, str):
+            _stamp_acknowledged_codex_sidecar(
+                agent, _turn_user_msg, wire_content, preflight_compressed=preflight_compressed,
+            )
+        return
     live_content = _turn_user_msg.get("content")
     from agent.session_persistence import _persist_lock, durable_user_row_content
     # Match the row the flush wrote (persist override = clean transcript), not the live bytes.
@@ -1167,6 +1307,7 @@ def build_turn_context(
         original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history,
     )
+    plugin_user_context = plugin_user_context if isinstance(plugin_user_context, str) else ""
     plugin_user_context = _merge_gateway_notes(
         agent, messages, current_turn_user_idx, plugin_user_context
     )
@@ -1191,6 +1332,10 @@ def build_turn_context(
                 agent, messages, current_turn_user_idx, ext_prefetch_cache,
                 plugin_user_context, preflight_compressed=compaction.compressed,
             )
+        elif getattr(agent, "api_mode", None) == "codex_app_server":
+            from agent.session_persistence import _persist_lock
+            with _persist_lock(agent):
+                _clear_codex_sidecar_stamp(messages[current_turn_user_idx])
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
 
@@ -1201,6 +1346,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context, ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=compaction.blocked,
+        preflight_compressed=compaction.compressed,
     )
 
 
@@ -1223,6 +1369,31 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
     return _sanitize_model
 
 
+def _mark_chat_recall_current_copy(
+    agent: Any, current: Dict[str, Any], wire: Any, *,
+    selected: Any, plugin_context: Any, position: int,
+) -> Optional[_ChatAutoRecallProvenance]:
+    """Bind selected recall to a fresh wire row, never to a historical text match."""
+    from agent.memory_manager import sanitize_context
+
+    observation = getattr(agent, "_last_auto_recall_observation", None)
+    if (getattr(agent, "api_mode", None) != "chat_completions"
+            or not isinstance(observation, dict)
+            or observation.get("mode") != "prefetch"
+            or observation.get("attempted") is not True
+            or observation.get("success") is not True
+            or not isinstance(selected, str)
+            or selected != getattr(agent, "_auto_recall_context", None)
+            or not sanitize_context(selected).strip()):
+        return None
+    expected = compose_user_api_content(current.get("content"), selected, plugin_context)
+    if not isinstance(expected, str) or wire.get("content") != expected:
+        return None  # multipart or a stale/rewritten sidecar has no string-origin proof
+    marker = uuid.uuid4().hex
+    wire[_AUTO_RECALL_CURRENT_KEY] = marker
+    return _ChatAutoRecallProvenance(marker, expected, selected, observation, position)
+
+
 def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
@@ -1240,6 +1411,10 @@ def build_api_messages(
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
     from agent.conversation_loop import _clone_message_for_send
     from agent.replay_cleanup import canonicalize_replay_history
+    from agent.turn_api_request import _release_chat_recall_cleanup
+
+    # A fresh build retires any abandoned request's private wire-copy binding.
+    _release_chat_recall_cleanup(agent)
 
     has_current = isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages)
     current_turn_message = messages[current_turn_user_idx] if has_current else None
@@ -1257,11 +1432,15 @@ def build_api_messages(
     split = current_turn_user_idx if has_current else 0
     canonical_messages = canonicalize_replay_history(messages[:split], now=turn_now) + messages[split:]
 
+    recall_provenance = None
     api_messages = []
     for idx, msg in enumerate(canonical_messages):
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
         # persisted history via nested containers; see _clone_message_for_send.
         api_msg = _clone_message_for_send(msg)
+        # Incoming history has no authority to supply request-local provenance.
+        for key in _AUTO_RECALL_PRIVATE_KEYS:
+            api_msg.pop(key, None)
         # api_content is bookkeeping (exact bytes sent), never a provider field — pop
         # it from EVERY outgoing copy. Persistence/display fields (display_*, _row_id,
         # timestamp) are local bookkeeping: strict OpenAI backends reject unknown keys
@@ -1285,6 +1464,11 @@ def build_api_messages(
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed
+            if type(current_turn_user_idx) is int:
+                recall_provenance = _mark_chat_recall_current_copy(
+                    agent, msg, api_msg, selected=ext_prefetch_cache,
+                    plugin_context=plugin_user_context, position=idx,
+                )
         elif (
             isinstance(_api_content, str) and _api_content
             and msg.get("role") in ("user", "assistant")
@@ -1332,4 +1516,15 @@ def build_api_messages(
         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
+    if recall_provenance is not None:
+        from dataclasses import replace
+
+        agent._chat_auto_recall_provenance = replace(
+            recall_provenance, position=recall_provenance.position + bool(effective_system),
+        )
+    # Cleanup ownership is independent of attribution validity. Keep the actual
+    # pre-selection list and its rows, including rows an in-place selector detaches.
+    agent._chat_auto_recall_cleanup_payloads = (
+        (api_messages, *api_messages) if getattr(agent, "api_mode", None) == "chat_completions" else ()
+    )
     return api_messages, effective_system

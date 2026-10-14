@@ -1407,6 +1407,7 @@ class _LoopState:
     # a consecutive-ineffective-attempt backstop, rearmed only after a provider response
     # reports a prompt below threshold.
     max_compression_attempts: Any
+    _preflight_compressed: bool = False
     api_call_count: int = 0
     final_response: Any = None
     interrupted: bool = False
@@ -1465,6 +1466,7 @@ _CTX_FIELDS = frozenset({
     "user_message", "original_user_message", "conversation_history", "effective_task_id", "turn_id",
     "_should_review_memory", "_plugin_user_context", "_ext_prefetch_cache", "messages",
     "active_system_prompt", "current_turn_user_idx", "_preflight_compression_blocked",
+    "_preflight_compressed",
 })
 # Keyword names each phase helper takes (minus ``agent``), cached per function object.
 _PHASE_PARAMS: Dict[Any, tuple] = {}
@@ -1533,6 +1535,8 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[Dict[str, Any]]:
         user_message=s.user_message, original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,
         should_review_memory=s._should_review_memory,
+        ext_prefetch_cache=s._ext_prefetch_cache, plugin_user_context=s._plugin_user_context,
+        preflight_compressed=s._preflight_compressed, current_turn_user_idx=s.current_turn_user_idx,
     )
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):
@@ -1731,8 +1735,12 @@ def run_conversation(
     addresses, after every history rewrite including post-turn micro-compaction.
     """
     from agent.turn_context import export_current_turn_boundary
+    from agent.chat_completion_helpers import _reset_stale_streak
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
+
+    # Cached agents must admit a fresh user turn; retries within that turn retain the bounded streak.
+    _reset_stale_streak(agent)
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False

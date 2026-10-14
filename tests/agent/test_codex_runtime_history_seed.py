@@ -50,11 +50,12 @@ def test_fresh_thread_is_seeded_with_prior_turns_but_not_the_current_one(monkeyp
     agent._codex_session.ensure_started()
     (_, params), = [(m, p) for (m, p) in client.requests if m == "thread/start"]
     instructions = params["developerInstructions"]
-    assert instructions.startswith("SOUL: you are Hermes")
-    assert "my dog is called Shadow" in instructions and "Noted: Shadow." in instructions
-    assert "called tools: memory" in instructions and "saved" in instructions
-    assert "what is my dog called?" not in instructions
-    assert instructions.count("SOUL: you are Hermes") == 1  # system rows are not re-rendered as history
+    assert instructions == "SOUL: you are Hermes"
+    seed = agent._codex_session._history_seed
+    assert "my dog is called Shadow" in seed and "Noted: Shadow." in seed
+    assert "called tools: memory" in seed and "saved" in seed
+    assert "what is my dog called?" not in seed
+    assert "SOUL: you are Hermes" not in seed  # current trusted prompt is not historical user data
     # The seed is not part of the recorded composition: the next turn keeps the thread.
     assert agent._codex_session_prompt == "SOUL: you are Hermes"
     codex_runtime._ensure_codex_session(agent, _HISTORY + [{"role": "assistant", "content": "Shadow"}])
@@ -82,4 +83,5 @@ def test_resumed_thread_gets_no_seed_but_a_failed_resume_fallback_does(monkeypat
     codex_runtime._ensure_codex_session(agent, _HISTORY)
     assert codex_runtime._start_codex_thread(agent) == "fresh"
     (_, start_params), = [(m, p) for (m, p) in failing.requests if m == "thread/start"]
-    assert "my dog is called Shadow" in start_params["developerInstructions"]
+    assert start_params["developerInstructions"] == "SOUL: you are Hermes"
+    assert "my dog is called Shadow" in agent._codex_session._history_seed

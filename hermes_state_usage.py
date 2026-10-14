@@ -82,6 +82,43 @@ _MODEL_USAGE_FIELDS = frozenset((
 class SessionUsageMixin:
     """Coalesced token writer, per-model usage rows, billing route."""
 
+    def update_auto_recall_metrics(
+        self, session_id: str, *, attempts: int = 1, failures: int = 0,
+        latency_ms: Optional[int] = None,
+    ) -> None:
+        """Atomically update an ensured session; the turn observer contains failures.
+
+        No row creation, accounting flush, deferred writer or storage recovery is
+        permitted for these best-effort observations. Missing rows are reported.
+        """
+        attempts = max(int(attempts or 0), 0)
+        failures = min(max(int(failures or 0), 0), attempts)
+        latency_ms = None if latency_ms is None else max(int(latency_ms), 0)
+        sql = """UPDATE sessions SET
+               auto_recall_attempt_count = COALESCE(auto_recall_attempt_count, 0) + ?,
+               auto_recall_success_count = COALESCE(auto_recall_success_count, 0) + ?,
+               auto_recall_failure_count = COALESCE(auto_recall_failure_count, 0) + ?,
+               auto_recall_total_latency_ms = COALESCE(auto_recall_total_latency_ms, 0) + COALESCE(?, 0),
+               auto_recall_min_latency_ms = CASE
+                   WHEN ? IS NULL THEN auto_recall_min_latency_ms
+                   WHEN auto_recall_min_latency_ms IS NULL THEN ?
+                   ELSE MIN(auto_recall_min_latency_ms, ?)
+               END,
+               auto_recall_max_latency_ms = CASE
+                   WHEN ? IS NULL THEN auto_recall_max_latency_ms
+                   WHEN auto_recall_max_latency_ms IS NULL THEN ?
+                   ELSE MAX(auto_recall_max_latency_ms, ?)
+               END
+               WHERE id = ?"""
+        params = (attempts, attempts - failures, failures, latency_ms,
+                  latency_ms, latency_ms, latency_ms, latency_ms, latency_ms, latency_ms, session_id)
+
+        def _write(conn):
+            if conn.execute(sql, params).rowcount != 1:
+                raise LookupError("auto-recall metrics: missing session")
+
+        self._execute_write(_write, patience_s=0.5, lock_timeout_s=0.5, best_effort=True)
+
     def update_session_billing_route(
         self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None,
     ) -> None:
