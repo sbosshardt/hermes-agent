@@ -53,6 +53,14 @@ The following source-level units were accepted on the maintained release branch.
 
 The prior focused stale-reset gate passed 74 tests; the vault gate passed 94. Canonical-branch synchronization additionally checks source/blob/mode identity and reruns the focused stale-reset suite. This is not a new full-suite pass or a fresh runtime rollout. Preserve historical broad-suite baseline comparisons and private rollout receipts separately.
 
+## Deployment split — 2026-10-16
+
+Published `execreations` remains the v2026.9.21 / Hermes v0.21.4 portfolio. This ledger update does not rebase that branch onto v0.21.6 and does not claim this SHA is the running tree.
+
+A separate local candidate, `d23580540b6eb585af581ce3f985485aeb198784`, documents a port of the retained carries onto stable v0.21.6 (`818c13be1dc4fd28987e1e881a9408224afd4535`) in parent `7f0d3d492f35db05f2e0b5069f212ed282ea4b23`. That candidate is not this branch. Do not retire a carry here merely because the candidate exists. Reclassify implementation, defaults, call sites, and tests before the next published replay.
+
+Native backup/export acceptance and receiving-MTA authserv-id pinning remain outside this ledger. They are not waived.
+
 ## Maintenance gate
 
 Use stable release tags for runtime upgrades. For each carry, compare implementation, defaults, call sites and tests; classify keep, retire, rewrite or split-trim. Keep public source history clean, preserve rollback references, and obtain separate authorization before posting upstream issues/PRs/comments.

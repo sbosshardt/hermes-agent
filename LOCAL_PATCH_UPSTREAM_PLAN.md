@@ -26,3 +26,5 @@
 ## Release and publication discipline
 
 Port only still-needed behavior onto an approved stable release, keep tests and runtime source consistent, and validate before any deployment. Runtime upgrades and gateway activation are separate from this branch synchronization. Publish reviewed accepted source to `sbosshardt/execreations`, then read back its exact SHA and confirm local divergence is zero.
+
+The 2026-10-16 ledger update records that a local v0.21.6 port candidate exists and is not this published branch. That note is not authority to open upstream issues, comments, or PRs, and it is not a release-tag replay of `execreations`.
