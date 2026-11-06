@@ -92,6 +92,13 @@ _EXAMPLE_ECHO_REJECT = frozenset(
 # detectable, an improvised one ("Casual check-in chat") would lock the title as ``llm``.
 _PROVISIONAL_GREETING_TITLE = "friendly greeting"
 
+# A small model may echo the user's conversational request instead of naming it.
+# Only those outputs trigger a topic recovered from the user's typed first clause.
+_CONVERSATIONAL_OPENER = re.compile(
+    r"^(?:I(?:'d| would) like (?:for )?(?:you )?to|I (?:want (?:you )?to|ask you to|would appreciate it if you could)|"
+    r"(?:please )?(?:can|could) you|would you mind|help me)\b\s*", re.IGNORECASE
+)
+
 
 _TITLE_PROMPT_TEMPLATE = (
     "You name chat sessions. Given the user's opening message, write a title "
@@ -468,6 +475,17 @@ def _is_prompt_example_echo(title: str) -> bool:
     return normalized in _EXAMPLE_ECHO_REJECT
 
 
+def _topic_fallback(user_message: str) -> Optional[str]:
+    """Extract at most six words from the typed first request clause, never added context."""
+    typed = strip_control_wrappers(user_message)
+    first_line = _first_line(typed)
+    # Do not cross a sentence boundary or use a reference/preview to supply a missing topic.
+    clause = re.split(r"[.!?;]|@(?:file|folder):|Pasted content:", first_line, maxsplit=1)[0].strip()
+    clause = _CONVERSATIONAL_OPENER.sub("", clause, count=1).strip(" ,:—-")
+    words = clause.split()
+    return " ".join(words[:6]) if words else None
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -551,6 +569,8 @@ def generate_title(
         if title is not None and _is_prompt_example_echo(title):
             logger.debug("Rejecting prompt-example echo title: %r", title)
             return None
+        if title is not None and _CONVERSATIONAL_OPENER.match(title):
+            return _topic_fallback(user_message)
         return title
     except Exception as e:
         # WARNING so it shows in agent.log without debug mode; stack at debug.
