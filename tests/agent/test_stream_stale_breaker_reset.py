@@ -18,6 +18,7 @@ quiet-mode / subagent sessions take that path and had the identical
 infinite stale-retry class.
 """
 
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -185,3 +186,55 @@ class TestNonStreamingSibling:
         resp = agent._interruptible_api_call({"model": "m", "messages": []})
         assert resp is not None
         assert agent._consecutive_stale_streams == 0
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_fresh_user_turn_clears_latched_streak_before_provider_guard(monkeypatch, streaming):
+    """Both request modes get another attempt on a new turn, not another stale-timeout wall."""
+    from agent import conversation_loop
+    from agent.chat_completion_helpers import _check_stale_giveup
+
+    monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "5")
+    agent = cast(Any, _make_fallback_agent(fallback_model=[]))
+    agent.streaming = streaming
+    response = object()
+    agent.client.chat.completions.create.return_value = response
+
+    def provider_turn(current_agent, user_message, **kwargs):
+        _check_stale_giveup(current_agent)
+        assert current_agent.client.chat.completions.create(stream=current_agent.streaming) is response
+        return {"completed": True, "messages": [], "final_response": "recovered"}
+
+    monkeypatch.setattr(conversation_loop, "_run_conversation_turn", provider_turn)
+    # Target run_conversation exports a boundary; the fake provider has no transcript.
+    monkeypatch.setattr("agent.turn_context.export_current_turn_boundary", lambda a, r, u: r)
+    for _ in range(2):
+        agent._consecutive_stale_streams = 5
+        agent.client.chat.completions.create.reset_mock()
+        result = conversation_loop.run_conversation(agent, "Try again")
+        assert result["final_response"] == "recovered"
+        agent.client.chat.completions.create.assert_called_once_with(stream=streaming)
+        assert agent._consecutive_stale_streams == 0
+
+
+def test_new_turn_reset_preserves_same_turn_default_five_stale_giveup(monkeypatch):
+    from agent import conversation_loop
+    from agent.chat_completion_helpers import _bump_stale_streak, _check_stale_giveup
+
+    monkeypatch.delenv("HERMES_STREAM_STALE_GIVEUP", raising=False)
+    agent = cast(Any, _make_fallback_agent(fallback_model=[]))
+    agent._consecutive_stale_streams = 5
+
+    def stale_turn(current_agent, user_message, **kwargs):
+        assert current_agent._consecutive_stale_streams == 0
+        for _ in range(5):
+            _bump_stale_streak(current_agent)
+        _check_stale_giveup(current_agent)
+        pytest.fail("Five stale responses in one turn must trigger the give-up guard")
+
+    monkeypatch.setattr(conversation_loop, "_run_conversation_turn", stale_turn)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            conversation_loop.run_conversation(agent, "Retry")
+        assert agent._consecutive_stale_streams == 5
+        agent.client.chat.completions.create.assert_not_called()

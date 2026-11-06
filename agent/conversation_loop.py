@@ -1828,6 +1828,10 @@ def run_conversation(
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
 
+    # A latched provider streak must not short-circuit a fresh user turn; retries
+    # inside this turn still accumulate against the same give-up threshold.
+    from agent.chat_completion_helpers import _reset_stale_streak
+    _reset_stale_streak(agent)
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
