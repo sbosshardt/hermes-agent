@@ -83,6 +83,16 @@ _MODEL_USAGE_FIELDS = frozenset((
 class SessionUsageMixin:
     """Coalesced token writer, per-model usage rows, billing route."""
 
+    def update_auto_recall_metrics(
+        self, session_id: str, *, attempts: int = 0, failures: int = 0,
+        latency_ms: Optional[int] = None,
+    ) -> None:
+        """Best-effort opt-in counters, never the default transcript writer."""
+        from hermes_state_telemetry import update_auto_recall_metrics
+        update_auto_recall_metrics(
+            self, session_id, attempts=attempts, failures=failures, latency_ms=latency_ms,
+        )
+
     def update_session_billing_route(
         self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None,
     ) -> None:

@@ -472,7 +472,16 @@ def _sanitize_message(
     """
     if not isinstance(msg, dict):
         return None
-    strip_keys = [k for k in msg if k in _STRIP_MSG_KEYS or (isinstance(k, str) and k.startswith("_"))]
+    # The request-local origin coordinate crosses this transport's copy for final
+    # middleware validation; it is scrubbed before hooks, debug dumps and provider I/O.
+    from agent.auto_recall_observation import _MARKER, _OriginMarker
+    strip_keys = [
+        k for k in msg
+        if k in _STRIP_MSG_KEYS or (
+            isinstance(k, str) and k.startswith("_")
+            and not (k == _MARKER and isinstance(msg.get(k), _OriginMarker))
+        )
+    ]
     if msg.get("role") == "assistant":
         strip_keys += [k for k in strip_reasoning if k in msg]
     kept_details = None

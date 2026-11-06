@@ -596,6 +596,10 @@ def _bind_turn_identity(
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+    from agent.auto_recall_observation import cleanup
+    cleanup(agent)
+    agent._last_auto_recall_observation = None
+    agent._auto_recall_context = ""
     # Tripwire: warn when this turn starts before the previous turn-end persist
     # (concurrent turns interleave transcript writes). Cleared in _persist_session.
     from agent.agent_runtime_helpers import note_turn_start
@@ -970,9 +974,19 @@ def _memory_turn_start_and_prefetch(
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
     Returns the prefetch text (``""`` when nothing was injected)."""
+    agent._last_auto_recall_observation = None
+    agent._auto_recall_context = ""
     if not agent._memory_manager:
         return ""
     _query = _memory_query_text(original_user_message)
+    if is_trivial_prompt(_query):
+        return ""
+    # The C04 rebind fence must succeed before either a hook or a read can run.
+    try:
+        if not agent._memory_manager.wait_for_session_boundary():
+            return ""
+    except Exception:
+        return ""
     # The author rides along so a provider can attribute THIS turn, not whoever opened the session.
     _author = turn_author if isinstance(turn_author, dict) else {}
     with suppress(Exception):
@@ -981,11 +995,30 @@ def _memory_turn_start_and_prefetch(
             author_id=_author.get("id") or None, author_name=_author.get("name") or None,
             author_is_bot=bool(_author.get("is_bot")),
         )
-    ext_prefetch_cache = ""
-    with suppress(Exception):
-        if not is_trivial_prompt(_query):
-            prefetched = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id)
-            ext_prefetch_cache = prefetched if isinstance(prefetched, str) and prefetched.strip() else ""
+    started = time.monotonic()
+    failure_reason = ""
+    try:
+        prefetched = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id)
+        ext_prefetch_cache = prefetched if isinstance(prefetched, str) and prefetched.strip() else ""
+        if not ext_prefetch_cache:
+            failure_reason = "empty_result"
+    except Exception as exc:
+        ext_prefetch_cache = ""
+        failure_reason = type(exc).__name__
+    latency_ms = max(0, int(round((time.monotonic() - started) * 1000)))
+    agent._auto_recall_context = ext_prefetch_cache
+    agent._last_auto_recall_observation = {
+        "mode": "prefetch", "attempted": True, "success": bool(ext_prefetch_cache),
+        "latency_ms": latency_ms, "context_chars": len(ext_prefetch_cache),
+        "failure_reason": failure_reason,
+    }
+    if getattr(agent, "_session_db_created", False) and getattr(agent, "_session_db", None) is not None:
+        try:
+            agent._session_db.update_auto_recall_metrics(
+                agent.session_id, attempts=1, failures=bool(failure_reason), latency_ms=latency_ms,
+            )
+        except Exception:
+            logger.warning("Auto-recall metrics persistence failed")
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
@@ -1333,11 +1366,17 @@ def build_api_messages(
     beyond the sidecar stamp, and the system prompt is built ONCE per session and
     replayed verbatim."""
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
+    from agent.auto_recall_observation import bind, cleanup
     from agent.conversation_loop import _clone_message_for_send
     from agent.replay_cleanup import canonicalize_replay_history
 
-    has_current = isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages)
+    cleanup(agent)
+    has_current = isinstance(current_turn_user_idx, int) and not isinstance(current_turn_user_idx, bool) and 0 <= current_turn_user_idx < len(messages)
     current_turn_message = messages[current_turn_user_idx] if has_current else None
+    expected_current_content = compose_user_api_content(
+        current_turn_message.get("content") if isinstance(current_turn_message, dict) else None,
+        ext_prefetch_cache, plugin_user_context,
+    )
 
     # Replay consumers canonicalize the persisted prefix on read; the request copy must
     # carry the same bytes or a resume diverges mid-prefix. Only the rows BEFORE this
@@ -1353,6 +1392,7 @@ def build_api_messages(
     canonical_messages = canonicalize_replay_history(messages[:split], now=turn_now) + messages[split:]
 
     api_messages = []
+    current_api_msg = None
     for idx, msg in enumerate(canonical_messages):
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
         # persisted history via nested containers; see _clone_message_for_send.
@@ -1369,6 +1409,7 @@ def build_api_messages(
         # Inject ephemeral context (memory prefetch + pre_llm_call user hooks)
         # at API time only; `messages` is untouched beyond the api_content stamp.
         if msg is current_turn_message and msg.get("role") == "user":
+            current_api_msg = api_msg
             if isinstance(_api_content, str) and _api_content:
                 # Reuse the prologue's stamp so sidecar and wire cannot drift
                 # and every pass this turn sends identical bytes.
@@ -1431,4 +1472,6 @@ def build_api_messages(
         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
+    position = next((i for i, row in enumerate(api_messages) if row is current_api_msg), -1)
+    bind(agent, api_messages, position, selected=ext_prefetch_cache, composed=expected_current_content)
     return api_messages, effective_system

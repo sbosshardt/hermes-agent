@@ -116,7 +116,9 @@ def build_request_payload(
     turn loop's :func:`build_api_request` and off-turn side requests (``ctx.side_question``,
     which reports through ``pre/post_auxiliary_call``) share it."""
     from agent.conversation_loop import _redecorate_prompt_cache_for_provider
+    from agent.auto_recall_observation import register_payload
 
+    register_payload(agent, api_messages)
     agent._reset_stream_delivery_tracking()
     # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
     agent._last_api_first_chunk_at = None
@@ -130,6 +132,7 @@ def build_request_payload(
             tools_for_api=tools_for_api,
         )
     )
+    register_payload(agent, api_messages)
     # A model that rejected image content gets text only; history keeps the images.
     strip_images_for_rejecting_model(agent, api_messages)
     observe_request_tools(agent, tools_for_api)
@@ -137,6 +140,7 @@ def build_request_payload(
         api_kwargs = agent._build_api_kwargs(api_messages)
     else:
         api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    register_payload(agent, api_kwargs)
     # Messages were scrubbed above; this walk covers the rest of the payload (tool descriptions,
     # extra_body, kwargs strings) — see sanitize_outbound_kwargs for the #50959 rationale.
     sanitize_outbound_kwargs(agent, api_kwargs)
@@ -164,6 +168,9 @@ def build_request_payload(
         api_kwargs = _llm_request_mw.payload
         _original_api_kwargs = _llm_request_mw.original_payload
         _llm_middleware_trace = _llm_request_mw.trace
+        register_payload(agent, api_kwargs)
+        register_payload(agent, _original_api_kwargs)
+        register_payload(agent, _llm_middleware_trace)
     except Exception:
         logger.warning("LLM request middleware failed; sending the request unmodified", exc_info=True)
         _original_api_kwargs = dict(api_kwargs)
@@ -183,13 +190,29 @@ def build_api_request(
     """Assemble the attempt's request in the original order (every mutation happens BEFORE
     middleware/hooks/debug dumps observe the payload)."""
     from agent.conversation_loop import _moa_client_consumes_prepared_request
+    from agent.auto_recall_observation import cleanup, observe_assembled
 
-    built = build_request_payload(
-        agent, api_messages=api_messages, _moa_prepared_request=_moa_prepared_request,
-        tools_for_api=tools_for_api, system_message=system_message, api_call_count=api_call_count,
-        api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
-    )
+    try:
+        built = build_request_payload(
+            agent, api_messages=api_messages, _moa_prepared_request=_moa_prepared_request,
+            tools_for_api=tools_for_api, system_message=system_message, api_call_count=api_call_count,
+            api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
+        )
+    except BaseException:
+        cleanup(agent, api_messages)
+        raise
     api_kwargs, api_messages, _moa_prepared_request = built.api_kwargs, built.api_messages, built._moa_prepared_request
+    try:
+        observe_assembled(agent, api_kwargs)
+        observation = getattr(agent, "_last_auto_recall_observation", None)
+        if (getattr(agent, "api_mode", None) == "chat_completions"
+                and isinstance(observation, dict) and observation.get("attempted")):
+            logger.info("Auto-recall chat assembly: appended=%s", bool(observation.get("memory_context_appended")))
+    finally:
+        # No origin coordinate may reach a hook, dump, provider or retained middleware
+        # copy. The observation is assembly-only, before any provider acknowledgement.
+        cleanup(agent, api_kwargs, built._original_api_kwargs, built._llm_middleware_trace,
+                api_messages, _moa_prepared_request)
     _fire_pre_api_request_hook(
         agent, api_kwargs, api_messages, built._llm_middleware_trace, messages=messages,
         original_user_message=original_user_message, approx_tokens=approx_tokens,

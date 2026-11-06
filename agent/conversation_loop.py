@@ -1354,6 +1354,8 @@ def _apply_context_engine_selection(
 ) -> list[dict[str, Any]]:
     """Run the optional per-turn ``ContextEngine.select_context()`` hook, fail-open: any
     exception or invalid return yields ``api_messages`` unchanged; history is never mutated."""
+    from agent.auto_recall_observation import register_payload
+    register_payload(agent, tuple(api_messages))  # retained even if the selector pops a row
     engine = getattr(agent, "context_compressor", None)
     if not _engine_overrides_hook(engine, "select_context"):
         return api_messages
@@ -1374,6 +1376,7 @@ def _apply_context_engine_selection(
             ),
             budget_tokens=getattr(engine, "context_length", 0) or 0,
         )
+        register_payload(agent, selected)
     except Exception:
         logger.warning(
             "Context engine select_context hook failed; using unmodified request messages (session=%s)",
@@ -1390,6 +1393,7 @@ def _apply_context_engine_selection(
         # carry persistence-only fields; the request copy was stripped BEFORE this hook, so strip the
         # selection too or those fields reach the provider. Dicts without them pass through as-is.
         stripped = [without_persistence_fields(m) for m in selected]
+        register_payload(agent, stripped)
         return selected if all(a is b for a, b in zip(stripped, selected)) else stripped
     logger.warning(
         "Context engine select_context returned an invalid value "
