@@ -13,7 +13,7 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
@@ -39,6 +39,7 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # shutdown_all() drain bound; workers are daemon threads so a wedged provider never
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
+_SESSION_BOUNDARY_WAIT_TIMEOUT_S = 8.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 # A background provider call (sync_turn / queue_prefetch) running longer than this is treated as
 # stuck. Well above the shutdown drain bound and the prefetch timeout so a slow-but-healthy backend
@@ -221,13 +222,15 @@ class MemoryManager:
         self._external_prefetch_timeout = timeout
         # Captured at build time, inside the profile scope the agent is built for.
         self._home_key = hermes_home_key()
-        # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
-        # the builtin-only path spawns no threads; one worker serializes a provider's writes.
+        # Independent lazy single-worker lanes: a slow write must not starve read preparation.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
+        self._prefetch_executor: Optional[ThreadPoolExecutor] = None
         self._sync_executor_lock = threading.Lock()
-        # Futures by durability class ("write" / "prefetch") so shutdown can drain FIFO
-        # within a bound, then report exactly what it abandoned.
+        # Admission completions, not executor futures: inline fallbacks own the same FIFO fences.
         self._background_futures: dict[Future, str] = {}
+        self._last_sync_future: Optional[Future] = None
+        self._last_prefetch_future: Optional[Future] = None
+        self._boundary_future: Optional[Future] = None
         self._shutting_down = False
         self._teardown_claim: Optional[str] = None  # see claim_teardown()
         self._shutdown_drain_state: dict[str, Any] = {
@@ -348,6 +351,8 @@ class MemoryManager:
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        if not self.wait_for_session_boundary():
+            return ""  # A pending or failed rebind cannot license a stale read.
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query or not self._owner_allows("prefetch"):
             return ""
@@ -356,6 +361,25 @@ class MemoryManager:
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
         )
         return "\n\n".join(p for p in parts if p and p.strip())
+
+    def wait_for_session_boundary(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the latest admitted rebind, including submission-lock admission, or fail closed."""
+        deadline = time.monotonic() + max(0.0, _SESSION_BOUNDARY_WAIT_TIMEOUT_S if timeout is None else timeout)
+        if not self._sync_executor_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            logger.warning("Memory session boundary admission timed out; skipping turn memory")
+            return False
+        try:
+            boundary = self._boundary_future
+        finally:
+            self._sync_executor_lock.release()
+        if boundary is None:
+            return True
+        try:
+            boundary.result(timeout=max(0.0, deadline - time.monotonic()))
+            return True
+        except Exception as exc:
+            logger.warning("Memory session boundary unavailable; skipping turn memory: %s", exc)
+            return False
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external
@@ -446,8 +470,8 @@ class MemoryManager:
                  turn_author: Optional[dict[str, Any]] = None) -> None:
         """Sync a completed turn to all providers on the background worker.
 
-        Never inline: a provider's ``sync_turn`` may block for minutes, which kept ``run_conversation``
-        open after the user saw the response. The single worker also serializes writes (turn N before N+1).
+        Normally off-thread: a provider's ``sync_turn`` may block for minutes, which kept
+        ``run_conversation`` open after the user saw the response. The write lane preserves FIFO.
         ``turn_author`` reaches only providers whose ``sync_turn`` accepts it.
 
         Everything forwarded is provider egress: turn strings AND the ``messages`` transcript slice
@@ -475,42 +499,84 @@ class MemoryManager:
         )
 
     def _submit_background(self, fn, *, kind: str = "write") -> None:
-        """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
-        durability class. Runs under the caller's contextvars (``ctx_bound``). If the executor is
-        unavailable outside shutdown, run inline — the historical fail-safe."""
+        """Reserve ordered completion before handing work to either lane or an inline fallback."""
         fn = ctx_bound(in_owner_home(self._bound_scope, fn))
-        executor = None if self._shutting_down else self._sync_executor
-        if executor is None and not self._shutting_down:
-            with self._sync_executor_lock:
-                if self._sync_executor is None and not self._shutting_down:
-                    try:
-                        # Daemon workers: a wedged provider must never block interpreter exit.
-                        from tools.daemon_pool import DaemonThreadPoolExecutor
-                        self._sync_executor = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="mem-sync")
-                    except Exception as e:  # pragma: no cover - resource exhaustion
-                        logger.warning("Failed to create memory sync executor: %s", e)
-                executor = self._sync_executor
-        future = None
-        try:
-            # Submit+track atomically with the shutdown snapshot. The callback is attached
-            # outside the lock: an already-completed future invokes callbacks synchronously.
-            with self._sync_executor_lock:
-                if self._shutting_down:
-                    logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
-                    return
-                if executor is not None:
-                    future = executor.submit(fn)
-                    self._background_futures[future] = kind
-        except RuntimeError:
+        attr = "_prefetch_executor" if kind == "prefetch" else "_sync_executor"
+        inline = False
+        with self._sync_executor_lock:
             if self._shutting_down:
-                logger.warning("Memory manager shut down during %s submission; task rejected", kind)
+                logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
                 return
-        if future is not None:
-            future.add_done_callback(self._forget_background_future)
+            previous_boundary = self._boundary_future
+            dependencies = ((self._last_sync_future, self._last_prefetch_future) if kind == "boundary"
+                            else (self._last_prefetch_future, previous_boundary) if kind == "prefetch"
+                            else (self._last_sync_future, previous_boundary))
+            future = Future()
+            self._background_futures[future] = "write" if kind == "boundary" else kind
+            if kind == "prefetch":
+                self._last_prefetch_future = future
+            else:
+                self._last_sync_future = future
+                if kind == "boundary":
+                    self._boundary_future = future
+
+            # An executor can enqueue and then report a failure. Only one adapter (worker
+            # or fallback) may claim this reservation after its dependencies complete.
+            claimed = False
+
+            def _run() -> None:
+                nonlocal claimed
+                try:
+                    for dependency in dependencies:
+                        if dependency is None:
+                            continue
+                        if dependency is previous_boundary and kind != "boundary":
+                            dependency.result()  # only a successful rebind licenses new work
+                        else:
+                            dependency.exception()  # completion, not success, for ordinary work
+                except BaseException as exc:
+                    try:
+                        future.set_exception(exc)
+                    except InvalidStateError:  # shutdown canceled this queued reservation
+                        pass
+                    return
+                with self._sync_executor_lock:
+                    if claimed or future.done():
+                        return
+                    claimed = True
+                if not future.set_running_or_notify_cancel():
+                    return
+                try:
+                    result = fn()
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+
+            executor = getattr(self, attr)
+            if executor is None:
+                try:
+                    from tools.daemon_pool import DaemonThreadPoolExecutor
+                    executor = DaemonThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="mem-prefetch" if kind == "prefetch" else "mem-sync",
+                    )
+                    setattr(self, attr, executor)
+                except Exception as exc:  # pragma: no cover - resource exhaustion
+                    logger.warning("Failed to create memory %s executor: %s", kind, exc)
+            try:
+                if executor is None:
+                    raise RuntimeError("executor unavailable")
+                executor.submit(_run)
+            except Exception as exc:  # pragma: no cover - resource exhaustion
+                logger.warning("Memory %s submission unavailable; running inline: %s", kind, exc)
+                inline = True
+        # Completed futures invoke callbacks synchronously; never attach under the lock.
+        future.add_done_callback(self._forget_background_future)
+        if not inline:
             return
         try:
-            fn()
-        except Exception as e:  # pragma: no cover - fn guards internally
+            _run()
+        except Exception as e:  # pragma: no cover - provider calls are normally guarded
             logger.debug("Inline memory background task failed: %s", e)
 
     def _call_unless_stalled(self, provider: MemoryProvider, call: Callable[[], Any]) -> None:
@@ -549,16 +615,18 @@ class MemoryManager:
             self._background_futures.pop(future, None)
 
     def flush_pending(self, timeout: Optional[float] = None) -> bool:
-        """Block until queued sync/prefetch work has drained (False on timeout).
-        With a single worker, a sentinel task completing proves every earlier task ran."""
-        executor = self._sync_executor
-        if executor is None:
-            return True
+        """Wait for both lanes and inline reservations admitted before this call, on one budget."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        if deadline is None:
+            self._sync_executor_lock.acquire()
+        elif not self._sync_executor_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            return False
         try:
-            executor.submit(lambda: None).result(timeout=timeout)
-        except Exception as e:
-            return isinstance(e, RuntimeError)  # executor already shut down — nothing pending
-        return True
+            tracked = tuple(self._background_futures)
+        finally:
+            self._sync_executor_lock.release()
+        _, pending = wait(tracked, timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
+        return not pending
 
     def get_all_tool_schemas(self) -> list[dict[str, Any]]:
         """Collect deduplicated tool schemas from all providers; reserved core tool names are
@@ -614,6 +682,8 @@ class MemoryManager:
         return result
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        if not self.wait_for_session_boundary():
+            return
         if not self._owner_allows("on_turn_start"):
             return
         message = _redact_for_provider(message)
@@ -635,7 +705,7 @@ class MemoryManager:
 
     def commit_session_boundary_async(self, messages: list[dict[str, Any]], *, new_session_id: str,
                                       parent_session_id: str = "", reason: str = "new_session") -> None:
-        """Queue old-session extraction + provider rebinding as ONE serialized task.
+        """Queue old-session extraction + provider rebinding as one durable write.
 
         ``on_session_end`` (LLM-bound, seconds) must run strictly BEFORE ``on_session_switch`` rebinds
         provider state; an ad-hoc thread raced the inline switch and misattributed transcripts.
@@ -644,41 +714,47 @@ class MemoryManager:
         on an ad-hoc thread raced the inline switch — providers key off internal state, so a late
         ``on_session_end`` ran against post-switch bindings (transcript misattributed to the new session id,
         double-ingest of the old turn buffer, new-session buffers cleared).
-        Submitting BOTH hooks as one task on the manager's single background worker gives both properties at
-        a single chokepoint: the caller returns immediately, and the worker's FIFO order serializes
-        end→switch against every other provider write (per-turn ``sync_all``, prefetches), which already
-        share the same worker. If the executor is unavailable, ``_submit_background`` degrades to inline
-        execution — the pre-#16454 synchronous behavior, slow but correct.
+        The write lane serializes writes, and admission dependencies fence both lanes:
+        earlier prefetch finishes before extraction; later prefetch waits for successful rebind.
+        Executor failure degrades to ordered inline execution.
         """
         if not self._providers or not self._owner_allows("session_boundary"):
             return
         snapshot = list(messages or [])
 
-        def _run() -> None:  # both hooks already guard per-provider
+        def _run() -> None:
             try:
                 self.on_session_end(snapshot)
             except Exception as e:  # pragma: no cover
                 logger.warning("Session-boundary extraction failed: %s", e)
-            try:
-                self.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=True, reason=reason)
-            except Exception as e:  # pragma: no cover
-                logger.warning("Session-boundary switch failed: %s", e)
+            # _each_provider logs but swallows errors. The boundary must still expose
+            # failed rebinding to turn-start/direct/queued prefetch fences.
+            if not self._switch_session_providers(new_session_id, parent_session_id=parent_session_id,
+                                                  reset=True, reason=reason):
+                logger.warning("Memory session boundary provider rebinding failed; later turn memory is fenced")
+                raise RuntimeError("Memory session boundary provider rebinding failed")
 
-        self._submit_background(_run)
+        self._submit_background(_run, kind="boundary")
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
                           rewound: bool = False, **kwargs) -> None:
         """Notify providers that ``AIAgent.session_id`` rotated without teardown
         (``/resume``, ``/branch``, ``/reset``, ``/new``, compression). ``rewound=True``
         (``/undo``): same id, truncated transcript."""
+        self._switch_session_providers(new_session_id, parent_session_id=parent_session_id,
+                                       reset=reset, rewound=rewound, **kwargs)
+
+    def _switch_session_providers(self, new_session_id: str, *, parent_session_id: str = "",
+                                  reset: bool = False, rewound: bool = False, **kwargs) -> bool:
         if not new_session_id or not self._owner_allows("on_session_switch"):
-            return
+            return False
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
-        self._each_provider(
+        successes = self._each_provider(
             "on_session_switch failed",
             lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs),
         )
+        return len(successes) == len(self._providers)
 
     @staticmethod
     def _checkpoint_api_version(provider: MemoryProvider) -> Optional[int]:
@@ -873,28 +949,37 @@ class MemoryManager:
             return dict(self._shutdown_drain_state)
 
     def _drain_sync_executor(self) -> None:
-        """Give queued FIFO work a bounded chance, then abandon explicitly."""
+        """Give both lanes and inline reservations one drain deadline, then cancel queued work."""
+        deadline = time.monotonic() + _SYNC_DRAIN_TIMEOUT_S
         with self._sync_executor_lock:
             self._shutting_down = True
-            executor = self._sync_executor
+            executors = (self._sync_executor, self._prefetch_executor)
             self._sync_executor = None
+            self._prefetch_executor = None
             tracked = dict(self._background_futures)
             self._shutdown_drain_state = {
-                "status": "draining" if executor is not None else "drained",
+                "status": "draining" if tracked else "drained",
                 "abandoned_writes": 0, "abandoned_prefetches": 0,
                 "active_tasks": sum(not future.done() for future in tracked),
             }
-        if executor is None:
-            return
-
-        # shutdown(wait=False) closes submission without touching the FIFO; waiting on the
-        # tracked futures lets the worker run every queued task in order up to the deadline.
-        executor.shutdown(wait=False, cancel_futures=False)
-        _, pending = wait(tuple(tracked), timeout=_SYNC_DRAIN_TIMEOUT_S)
-        cancelled = [tracked[future] for future in pending if future.cancel()]
+        # Closing submissions keeps both queues intact through the shared drain opportunity.
+        for executor in executors:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=False)
+        _, pending = wait(tuple(tracked), timeout=max(0.0, deadline - time.monotonic()))
+        cancelled = []
+        for future in pending:
+            if future.cancel():
+                cancelled.append(tracked[future])
+                # Admission futures are not executor-owned. Wake both wait() and
+                # dependency adapters so none can execute a late queued rebind.
+                future.set_running_or_notify_cancel()
         active_tasks = len(pending) - len(cancelled)
         abandoned_prefetches = cancelled.count("prefetch")
         abandoned_writes = len(cancelled) - abandoned_prefetches
+        for executor in executors:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
         with self._sync_executor_lock:
             self._shutdown_drain_state.update(
                 status="timed_out" if pending else "drained", abandoned_writes=abandoned_writes,
