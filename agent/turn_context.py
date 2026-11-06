@@ -116,8 +116,9 @@ def compose_multimodal_context_part(
     """The ephemeral context of one turn (memory prefetch + ``pre_llm_call``) as one text
     block; ``None`` when nothing is injected. The string sidecar appends it to ``content``;
     a multimodal (list) turn carries it as a durable text part (#71998)."""
-    fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
-    injections = [part for part in (fenced, plugin_user_context) if part]
+    fenced = build_memory_context_block(ext_prefetch_cache) if isinstance(ext_prefetch_cache, str) and ext_prefetch_cache.strip() else ""
+    plugin = plugin_user_context if isinstance(plugin_user_context, str) and plugin_user_context.strip() else ""
+    injections = [part for part in (fenced, plugin) if part]
     return "\n\n".join(injections) if injections else None
 
 
@@ -889,8 +890,8 @@ def _collect_pre_llm_call_context(
                 if blocks is not None and isinstance(_msg, str) and _msg.strip():
                     blocks.append(_msg.strip())
                 continue
-            if isinstance(r, dict) and r.get("context"):
-                _piece = str(r["context"])
+            if isinstance(r, dict) and isinstance(r.get("context"), str) and r["context"].strip():
+                _piece = r["context"]
             elif isinstance(r, str) and r.strip():
                 _piece = r
             else:
@@ -983,7 +984,8 @@ def _memory_turn_start_and_prefetch(
     ext_prefetch_cache = ""
     with suppress(Exception):
         if not is_trivial_prompt(_query):
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+            prefetched = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id)
+            ext_prefetch_cache = prefetched if isinstance(prefetched, str) and prefetched.strip() else ""
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
