@@ -85,6 +85,12 @@ class RuntimeSessionLifecycleMixin:
             payload['display_metadata'] = display_metadata
         return self._apply('session.user_content', payload)['value']
 
+    def update_auto_recall_metrics(self, session_id, *, attempts=0, failures=0, latency_ms=None):
+        self._session(session_id)
+        self._apply('session.auto_recall_metrics', {
+            'attempts': attempts, 'failures': failures, 'latency_ms': latency_ms,
+        })
+
     def end_session(self, session_id, end_reason):
         self._session(session_id)
         self._apply('session.end', {'end_reason': end_reason})

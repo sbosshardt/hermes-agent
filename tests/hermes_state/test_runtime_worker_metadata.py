@@ -76,6 +76,12 @@ def test_worker_route_and_api_content_preserve_exact_usage_and_target_fences(tmp
             stored = conn.execute('SELECT api_content, display_metadata FROM messages WHERE id=?', (row_id,)).fetchone()
         assert stored[0] == 'wire-meta'
         assert db._decode_display_metadata(stored[1]) == {'sidecar_provenance': 'marker'}
+        store.update_auto_recall_metrics('owned', attempts=1, failures=0, latency_ms=12)
+        with db._read_ctx() as conn:
+            metrics = conn.execute(
+                'SELECT auto_recall_attempt_count, auto_recall_success_count, auto_recall_total_latency_ms '
+                'FROM sessions WHERE id=?', ('owned',)).fetchone()
+        assert tuple(metrics) == (1, 1, 12)
         with db._read_ctx() as conn:
             usage = [tuple(r) for r in conn.execute(
                 'SELECT model,billing_provider,input_tokens,output_tokens FROM session_model_usage WHERE session_id=? ORDER BY model', ('owned',))]

@@ -222,6 +222,43 @@ def worker_message_api_content(db, conn, session_id, payload):
     return {'value': _merge_worker_api_content(db, conn, session_id, payload, _row_id(payload))}
 
 
+def worker_auto_recall_metrics(db, conn, session_id, payload):
+    """Same counters as SessionDB.update_auto_recall_metrics, inside the worker transaction."""
+    from hermes_state_telemetry import _nonnegative_int
+    if set(payload) != {'attempts', 'failures', 'latency_ms'}:
+        raise RuntimeStoreError('invalid_params')
+    attempts, failures, latency_ms = payload['attempts'], payload['failures'], payload['latency_ms']
+    if isinstance(attempts, (int, float)) and not isinstance(attempts, bool) and attempts < 0:
+        return {'value': None}
+    count = _nonnegative_int(attempts)
+    failed = min(count, _nonnegative_int(failures))
+    if not count:
+        count = max(1, _nonnegative_int(failures), int(latency_ms is not None))
+        failed = min(count, _nonnegative_int(failures))
+    if not count:
+        return {'value': None}
+    latency = None if latency_ms is None else _nonnegative_int(latency_ms)
+    changed = conn.execute(
+        """UPDATE sessions SET
+           auto_recall_attempt_count = auto_recall_attempt_count + ?,
+           auto_recall_success_count = auto_recall_success_count + ?,
+           auto_recall_failure_count = auto_recall_failure_count + ?,
+           auto_recall_total_latency_ms = auto_recall_total_latency_ms + COALESCE(?, 0),
+           auto_recall_min_latency_ms = CASE WHEN ? IS NULL THEN auto_recall_min_latency_ms
+               WHEN auto_recall_min_latency_ms IS NULL THEN ?
+               ELSE MIN(auto_recall_min_latency_ms, ?) END,
+           auto_recall_max_latency_ms = CASE WHEN ? IS NULL THEN auto_recall_max_latency_ms
+               WHEN auto_recall_max_latency_ms IS NULL THEN ?
+               ELSE MAX(auto_recall_max_latency_ms, ?) END
+           WHERE id = ?""",
+        (count, count - failed, failed, latency, latency, latency, latency,
+         latency, latency, latency, session_id),
+    ).rowcount
+    if changed != 1:
+        raise LookupError('missing session for optional telemetry')
+    return {'value': None}
+
+
 def worker_user_content(db, conn, session_id, payload):
     """Rewrite ONE active user row of this session, same guards as ``SessionDB.set_user_message_content``."""
     if set(payload) - {'display_metadata'} != {'row_id', 'content'}:
@@ -246,6 +283,7 @@ WORKER_LIFECYCLE_HANDLERS = {
     'session.billing_route': worker_billing_route,
     'session.api_content': worker_api_content,
     'session.message_api_content': worker_message_api_content,
+    'session.auto_recall_metrics': worker_auto_recall_metrics,
     'session.user_content': worker_user_content,
     'session.create': worker_create,
     'session.end': worker_end,

@@ -215,6 +215,14 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
         )),
         # GW-18 (package 10, #140968): write-side revision a transcript-derived cache keys on.
         ('32 2026-10-18T10:11Z 1fc1999769', (('+', 'transcript_revision', 'tool_names'),)),
+        ('33 2026-11-07T17:25Z local-auto-recall', (
+            ('+', 'auto_recall_attempt_count', 'api_call_count'),
+            ('+', 'auto_recall_success_count', 'auto_recall_attempt_count'),
+            ('+', 'auto_recall_failure_count', 'auto_recall_success_count'),
+            ('+', 'auto_recall_total_latency_ms', 'auto_recall_failure_count'),
+            ('+', 'auto_recall_min_latency_ms', 'auto_recall_total_latency_ms'),
+            ('+', 'auto_recall_max_latency_ms', 'auto_recall_min_latency_ms'),
+        )),
         ),
     ),
     "messages": _TableHistory(
