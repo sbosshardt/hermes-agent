@@ -31,7 +31,9 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform, PlatformConfig
-from utils import is_truthy_value
+from utils import atomic_json_write, is_truthy_value
+from hermes_constants import get_hermes_home
+from .auth_retry import AuthRetryMixin, _has_temporary_aligned_dkim_failure, _verify_temporary_dkim
 from gateway.platforms._shared import get_scoped_secret as _get_secret, coerce_port, decode_json_list_literal, send_error
 from gateway.platforms.send_targets import StandaloneSendPolicy, regex_stripped_parser
 
@@ -447,7 +449,7 @@ def _attach_file(msg: MIMEMultipart, path: Path, filename: str) -> None:
         msg.attach(part)
 
 
-class EmailAdapter(BasePlatformAdapter):
+class EmailAdapter(AuthRetryMixin, BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
     serial_receive_loop = True  # the IMAP poll loop awaits each message before dispatching the next
     # One email carries the whole body, so cron delivery hands over the full payload untruncated.
@@ -455,8 +457,8 @@ class EmailAdapter(BasePlatformAdapter):
 
     # Per-account seen-UID snapshot surviving adapter recreation: the reconnect watcher builds a FRESH
     # adapter per retry; without this connect(is_reconnect=True) would re-mark the mailbox seen and skip
-    # mail that arrived during the outage. Keyed by address (multiplex runs several accounts); same-process only.
-    _seen_uids_snapshot: dict[str, set] = {}
+    # mail that arrived during the outage. Keyed by profile + mailbox; same-process only.
+    _seen_uids_snapshot: dict[tuple[str, str], set] = {}
     # Accounts already warned about a missing authserv_id pin. Per address, not per first connect: an account whose
     # first connect fails is brought up by the reconnect watcher (is_reconnect=True) and must still warn once.
     _missing_pin_warned: set = set()
@@ -491,6 +493,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._authserv_id = (extra.get("authserv_id", "") or _get_secret("EMAIL_AUTHSERV_ID", "")).strip().lower()
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
+        self._init_auth_retry()
         self._poll_task: Optional[asyncio.Task] = None
         self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
         # chat_id (sender email) -> last subject + message-id for threading
@@ -562,19 +565,24 @@ class EmailAdapter(BasePlatformAdapter):
         """Connection test + seen-UID baseline. Sets a fatal error and returns False on failure."""
         try:
             with self._inbox() as imap:
-                snapshot = self._seen_uids_snapshot.get(self._address)
+                self._sync_auth_retry_state(imap)
+                if not self._initialize_auth_retry_state():
+                    self._set_fatal_error("email_auth_retry_state_error", self._auth_retry_state_error, retryable=False)
+                    return False
+                snapshot = self._seen_uids_snapshot.get(self._mailbox_snapshot_key)
                 if is_reconnect and snapshot is not None:
                     # Same-process reconnect: restore the previous adapter's baseline so mail that
                     # arrived during the outage stays eligible for the next poll.
-                    self._seen_uids = set(snapshot)
+                    self._seen_uids = set(snapshot) - self._pending_auth_retries
                     passed = "[Email] IMAP reconnect test passed. Restored %d seen UIDs; messages received during the outage will be processed."
                 else:  # first connect (or no snapshot): mark all existing messages seen
                     status, data = imap.uid("search", None, "ALL")
-                    self._seen_uids.update(data[0].split() if status == "OK" and data and data[0] else ())
+                    self._seen_uids.update(uid for uid in (data[0].split() if status == "OK" and data and data[0] else ())
+                                           if uid not in self._pending_auth_retries)
                     passed = "[Email] IMAP connection test passed. %d existing messages skipped."
                 self._trim_seen_uids()
                 logger.info(passed, len(self._seen_uids))
-            self._seen_uids_snapshot[self._address] = set(self._seen_uids)
+            self._seen_uids_snapshot[self._mailbox_snapshot_key] = set(self._seen_uids)
             return True
         except Exception as e:
             # Always set an explicit fatal code, else the gateway treats every failure as transient with zero
@@ -644,7 +652,7 @@ class EmailAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         async def authorize_on_loop(msg_data: dict[str, Any]) -> bool:
-            return self._sender_accepted(msg_data["sender_addr"], msg_data)
+            return self._sender_accepted(msg_data["sender_addr"], msg_data, for_auth_retry=True)
 
         def gate(candidate: dict[str, Any]) -> bool:
             # Authorization reads profile-scoped policy and pairing state on the adapter's event loop;
@@ -680,6 +688,10 @@ class EmailAdapter(BasePlatformAdapter):
         results = []
         try:
             with self._inbox() as imap:
+                self._sync_auth_retry_state(imap)
+                if not self._initialize_auth_retry_state():
+                    self._retry_failure()
+                    return results
                 status, data = imap.uid("search", None, "UNSEEN")
                 for uid in (data[0].split() if status == "OK" and data and data[0] else []):
                     if uid in self._seen_uids:
@@ -692,18 +704,38 @@ class EmailAdapter(BasePlatformAdapter):
                         logger.warning("[Email] Unusable pre-authorization headers for UID %s, skipping", uid)
                         self._mark_uid_consumed(imap, uid)
                         continue
+                    candidate = None
                     try:
                         candidate = self._parse_fetched_headers(uid, raw_headers)
                         accepted = candidate is not None and preauthorize(candidate)
                     except Exception as auth_exc:
                         logger.error("[Email] Failed to authorize message UID %s, skipping: %s", uid, auth_exc)
                         accepted = False
-                    if not accepted:
+                    if not accepted or candidate is None:
                         self._mark_uid_consumed(imap, uid)
+                        if not self._clear_auth_retry(uid):
+                            self._retry_failure()
+                            return results
                         continue
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    temporary = (self._require_authenticated_sender and not candidate["sender_authenticated"]
+                                 and candidate["temporary_aligned_dkim_failure"])
+                    status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])" if temporary else "(RFC822)")
                     if status != "OK":
                         continue  # transient per-UID refusal: leave unseen so the next poll retries
+                    if temporary:
+                        raw_email = _imap_payload(msg_data)
+                        if raw_email is None:
+                            continue
+                        try:
+                            parsed = self._process_auth_retry(imap, uid, raw_email, candidate, preauthorize)
+                        except Exception as parse_exc:
+                            logger.error("[Email] Failed to process retry UID %s: %s", uid, parse_exc)
+                            continue
+                        if self._last_fetch_failed:
+                            return results
+                        if parsed is not None:
+                            results.append(parsed)
+                        continue
                     # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
                     # but NOT before the fetch: a connection failure must leave the rest of the batch eligible for the next poll.
                     self._seen_uids.add(uid)
@@ -726,7 +758,7 @@ class EmailAdapter(BasePlatformAdapter):
             logger.error("[Email] IMAP fetch error: %s", e)
             self._last_fetch_failed, self._last_fetch_error = True, str(e)
         # Keep the reconnect snapshot current so a mid-outage adapter recreation does not re-dispatch messages already processed.
-        self._seen_uids_snapshot[self._address] = set(self._seen_uids)
+        self._seen_uids_snapshot[self._mailbox_snapshot_key] = set(self._seen_uids)
         return results
 
     def _message_metadata(self, uid: bytes, msg: email_lib.message.Message) -> Optional[dict[str, Any]]:
@@ -744,7 +776,8 @@ class EmailAdapter(BasePlatformAdapter):
         sender_authenticated, auth_reason = _verify_sender_authentication(msg, sender_addr, authserv_id=self._authserv_id)
         return {"uid": uid, "sender_addr": sender_addr, "sender_name": sender_name, "subject": subject,
                 "message_id": msg.get("Message-ID", ""), "in_reply_to": msg.get("In-Reply-To", ""),
-                "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason}
+                "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason,
+                "temporary_aligned_dkim_failure": _has_temporary_aligned_dkim_failure(msg, sender_addr, authserv_id=self._authserv_id)}
 
     def _parse_fetched_headers(self, uid: bytes, raw_headers: bytes | bytearray) -> Optional[dict[str, Any]]:
         """Parse the bounded IMAP header preflight without constructing a MIME tree."""
@@ -773,7 +806,7 @@ class EmailAdapter(BasePlatformAdapter):
         behavior = (self.config.extra or {}).get("unauthorized_dm_behavior")
         return isinstance(behavior, str) and behavior.strip().lower() in {"pair", "decline"}
 
-    def _sender_accepted(self, sender_addr: str, msg_data: dict[str, Any]) -> bool:
+    def _sender_accepted(self, sender_addr: str, msg_data: dict[str, Any], *, for_auth_retry: bool = False) -> bool:
         """Pre-dispatch sender gate: self, automated, authorization, From: authentication."""
         if sender_addr == self._address.lower():
             return False
@@ -811,6 +844,9 @@ class EmailAdapter(BasePlatformAdapter):
         # Warn only where the operator can act: a known misconfiguration, or a listed contact's own mail failing.
         # Forged stranger mail (open access grants everyone) stays at debug.
         if self._require_authenticated_sender and not msg_data.get("sender_authenticated", False):
+            # Header admission only: the ordinary dispatch caller never opts into this.
+            if for_auth_retry and msg_data.get("temporary_aligned_dkim_failure", False):
+                return True
             auth_reason = msg_data.get("auth_reason", "no verdict")
             hint = _DROP_HINTS.get(auth_reason, "")
             if is_listed or (granted and hint):
