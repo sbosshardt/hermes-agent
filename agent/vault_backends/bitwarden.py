@@ -14,12 +14,14 @@ import logging
 import os
 import shutil
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from agent.secret_sources.base import run_cli, scrub_ansi
 from agent.vault_backends import unlock as _unlock
 from agent.vault_backends.base import LoginBackend, UnlockRequired, run_with_secret_env
+from agent.vault_backends.unattended import private_path, profile_lock, read_password
 from agent.vault_store import VaultItemMeta, normalize_origin
 
 logger = logging.getLogger(__name__)
@@ -47,23 +49,79 @@ class BitwardenLoginBackend(LoginBackend):
 
     def _env(self, session_token: Optional[str]) -> dict[str, str]:
         env = {k: os.environ[k] for k in _ENV_KEEP if k in os.environ}
+        if self.cfg.get("unattended_password_file"):
+            env["BITWARDENCLI_APPDATA_DIR"] = private_path(
+                str(self.cfg.get("appdata_dir") or ""), "vault", secret_file=False)
         env["NO_COLOR"] = "1"
         if session_token:
             env["BW_SESSION"] = session_token
         return env
 
     def is_unlocked(self) -> bool:
-        return _unlock.is_unlocked(self.name)
+        if not _unlock.is_unlocked(self.name):
+            return False
+        if self.cfg.get("unattended_password_file"):
+            try:
+                if not self._account_is_expected():
+                    _unlock.lock(self.name)
+                    return False
+            except Exception:
+                _unlock.lock(self.name)
+                return False
+        return True
+
+    def fill_context(self):
+        # The native tool rechecks metadata inside this context before resolving a secret.
+        return profile_lock() if self.cfg.get("unattended_password_file") else nullcontext()
+
+    def _account_is_expected(self) -> bool:
+        expected = str(self.cfg.get("account_email") or "").strip().lower()
+        if not expected:
+            return False
+        proc = run_cli([str(self._bw()), "status", "--nointeraction"], env=self._env(None),
+                       timeout=_TIMEOUT, timeout_message="bw status timed out", label="bw",
+                       stdin=subprocess.DEVNULL)
+        try:
+            account = json.loads(proc.stdout or "")
+        except (ValueError, TypeError):
+            return False
+        return (proc.returncode == 0 and isinstance(account, dict)
+                and account.get("status") in ("locked", "unlocked")
+                and str(account.get("userEmail") or "").strip().lower() == expected)
+
+    def try_unattended_unlock(self) -> bool:
+        configured = str(self.cfg.get("unattended_password_file") or "")
+        if not configured:
+            return False
+        with profile_lock():
+            if self.is_unlocked():
+                return True
+            password = read_password(configured)
+            try:
+                # Status uses no master/session secret; bind the expected account first.
+                if not self._account_is_expected():
+                    raise RuntimeError("Bitwarden CLI is not signed in as the configured bot account")
+                self.unlock(password)
+            except Exception:
+                raise RuntimeError("Bitwarden unattended unlock failed") from None
+            finally:
+                del password
+            return True
 
     def unlock(self, master_password: str) -> None:
         # bw refuses a piped password ("Master password is required"); its non-interactive contract is
         # --passwordenv: the variable exists only in the child's environment, never in argv or ours.
+        if self.cfg.get("unattended_password_file") and not self._account_is_expected():
+            _unlock.lock(self.name)
+            raise RuntimeError("Bitwarden CLI is not signed in as the configured bot account")
         generation = _unlock.begin_unlock(self.name)
         proc = run_with_secret_env([str(self._bw()), "unlock", "--raw", "--nointeraction", "--passwordenv", "HERMES_BW_MASTER"],
                                    env=self._env(None), secret_env="HERMES_BW_MASTER", secret=master_password,
                                    timeout=_TIMEOUT, label="bw")
         token = (proc.stdout or "").strip()
         if proc.returncode != 0 or not token:
+            if self.cfg.get("unattended_password_file"):
+                raise RuntimeError("Bitwarden unattended unlock failed")
             err = scrub_ansi(proc.stderr or "").strip()[:200]
             if "not logged in" in err.lower():
                 err = "not logged in — run `bw login` once in a terminal first"
@@ -75,6 +133,9 @@ class BitwardenLoginBackend(LoginBackend):
         token = _unlock.get_session_token(self.name)
         if not token:
             raise UnlockRequired(self)
+        if self.cfg.get("unattended_password_file") and not self._account_is_expected():
+            _unlock.lock(self.name)
+            raise UnlockRequired(self)
         proc = run_cli([str(self._bw()), *args, "--nointeraction"], env=self._env(token), timeout=_TIMEOUT,
                        label="bw", timeout_message="bw timed out", stdin=subprocess.DEVNULL)
         if proc.returncode != 0:
@@ -82,12 +143,16 @@ class BitwardenLoginBackend(LoginBackend):
             if "locked" in err.lower() or "session" in err.lower():
                 _unlock.lock(self.name)
                 raise UnlockRequired(self)
+            if self.cfg.get("unattended_password_file"):
+                raise RuntimeError("Bitwarden unattended operation failed")
             raise RuntimeError(f"bw failed: {err[:200]}")
         return proc.stdout or ""
 
     def list_items(self) -> list[VaultItemMeta]:
         if not self.is_unlocked():
             return []
+        if self.cfg.get("unattended_password_file"):
+            self._run("sync")
         raw = json.loads(self._run("list", "items") or "[]")
         out: list[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
@@ -114,18 +179,22 @@ class BitwardenLoginBackend(LoginBackend):
                 id=f"{self.prefix}{item.get('id')}", kind="login", label=str(item.get("name") or origins[0]),
                 origin=origins[0], created_at=str(item.get("creationDate") or ""),
                 identifier_type="username" if username else None, identifier=username,
-                allowed_origins=web_origins))
+                allowed_origins=web_origins, has_otp=bool(login.get("totp"))))
         return out
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         return next((m for m in self.list_items() if m.id == handle), None)
 
     def resolve_password(self, handle: str) -> str:
+        if self.cfg.get("unattended_password_file"):
+            self._run("sync")
         return self._run("get", "password", handle[len(self.prefix):]).rstrip("\r\n")
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `bw get totp <id>` mints the current code from the item's TOTP seed; "No TOTP available" otherwise.
         try:
+            if self.cfg.get("unattended_password_file"):
+                self._run("sync")
             code = self._run("get", "totp", handle[len(self.prefix):]).strip()
         except Exception:
             return None

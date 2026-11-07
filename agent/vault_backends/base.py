@@ -38,6 +38,10 @@ class LoginBackend(ABC):
     def is_unlocked(self) -> bool:
         return True
 
+    def try_unattended_unlock(self) -> bool:
+        """Explicitly opted-in manager bootstrap; ordinary backends never auto-unlock."""
+        return False
+
     def fill_context(self) -> AbstractContextManager:
         """Optional profile-exclusive context, entered after the origin pre-check: covers the in-context
         metadata re-check, secret resolution and the CDP write."""

@@ -2449,6 +2449,9 @@ DEFAULT_CONFIG = {
         "bitwarden": {
             "enabled": True,        # `bw` CLI (Password Manager, not Secrets Manager); run `bw login` once first.
             "binary_path": "",      # absolute path to bw; empty = PATH.
+            "unattended_password_file": "",  # opt-in: private 0600 BW_PASSWORD file under this profile's secrets/.
+            "account_email": "",    # required expected account for unattended mode.
+            "appdata_dir": "",      # required private 0700 directory under this profile's vault/.
         },
     },
     "secrets": {
