@@ -145,15 +145,58 @@ def worker_billing_route(db, conn, session_id, payload):
     return {'value': None}
 
 
+def _optional_display_metadata(payload, required):
+    if set(payload) - {'display_metadata'} != required or (
+            'display_metadata' in payload and not isinstance(payload['display_metadata'], dict)):
+        raise RuntimeStoreError('invalid_params')
+    return payload.get('display_metadata', None)
+
+
+def _merge_worker_api_content(db, conn, session_id, payload, row_id):
+    from hermes_state_messages import _scrub_surrogates
+    content = db._encode_content(payload['content'])
+    if row_id is None:
+        row = conn.execute(
+            "SELECT id, display_metadata FROM messages WHERE session_id=? AND role='user' AND active=1 "
+            "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+        if row is None or conn.execute(
+                "SELECT 1 FROM messages WHERE id=? AND content IS ?", (row[0], content)).fetchone() is None:
+            return 0
+        target_id, stored = row
+    else:
+        row = conn.execute(
+            "SELECT display_metadata FROM messages WHERE id=? AND session_id=? AND role='user' AND active=1 "
+            "AND content IS ?", (row_id, session_id, content)).fetchone()
+        if row is None:
+            return 0
+        target_id, stored = row_id, row[0]
+    metadata = db._decode_display_metadata(stored) or {}
+    patch = payload['display_metadata']
+    metadata.update({key: value for key, value in patch.items() if value is not None})
+    for key, value in patch.items():
+        if value is None:
+            metadata.pop(key, None)
+    return conn.execute(
+        "UPDATE messages SET api_content=?, display_metadata=? WHERE id=? AND session_id=? AND role='user' "
+        "AND active=1 AND content IS ?",
+        (_scrub_surrogates(payload['api_content']), db._encode_display_metadata(metadata) if metadata else None,
+         target_id, session_id, content)).rowcount
+
+
 def worker_api_content(db, conn, session_id, payload):
     from hermes_state_messages import _scrub_surrogates
-    if set(payload) != {'content', 'api_content'} or not isinstance(payload['api_content'], str):
+    metadata = _optional_display_metadata(payload, {'content', 'api_content'})
+    if metadata is None and not isinstance(payload['api_content'], str):
         raise RuntimeStoreError('invalid_params')
-    value = conn.execute(
-        "UPDATE messages SET api_content=? WHERE id=(SELECT id FROM messages WHERE session_id=? "
-        "AND role='user' AND active=1 ORDER BY id DESC LIMIT 1) AND content IS ?",
-        (_scrub_surrogates(payload['api_content']), session_id, db._encode_content(payload['content']))).rowcount
-    return {'value': value}
+    if metadata is not None and payload['api_content'] is not None and not isinstance(payload['api_content'], str):
+        raise RuntimeStoreError('invalid_params')
+    if metadata is None:
+        value = conn.execute(
+            "UPDATE messages SET api_content=? WHERE id=(SELECT id FROM messages WHERE session_id=? "
+            "AND role='user' AND active=1 ORDER BY id DESC LIMIT 1) AND content IS ?",
+            (_scrub_surrogates(payload['api_content']), session_id, db._encode_content(payload['content']))).rowcount
+        return {'value': value}
+    return {'value': _merge_worker_api_content(db, conn, session_id, payload, None)}
 
 
 def _row_id(payload):
@@ -166,12 +209,17 @@ def _row_id(payload):
 def worker_message_api_content(db, conn, session_id, payload):
     """Row-addressed sidecar backfill, same guards as ``SessionDB.set_message_api_content``."""
     from hermes_state_messages import _scrub_surrogates
-    if set(payload) != {'row_id', 'content', 'api_content'} or not isinstance(payload['api_content'], str):
+    metadata = _optional_display_metadata(payload, {'row_id', 'content', 'api_content'})
+    if metadata is None and not isinstance(payload['api_content'], str):
         raise RuntimeStoreError('invalid_params')
-    return {'value': conn.execute(
-        "UPDATE messages SET api_content=? WHERE id=? AND session_id=? AND role='user' AND active=1 AND content IS ?",
-        (_scrub_surrogates(payload['api_content']), _row_id(payload), session_id,
-         db._encode_content(payload['content']))).rowcount}
+    if metadata is not None and payload['api_content'] is not None and not isinstance(payload['api_content'], str):
+        raise RuntimeStoreError('invalid_params')
+    if metadata is None:
+        return {'value': conn.execute(
+            "UPDATE messages SET api_content=? WHERE id=? AND session_id=? AND role='user' AND active=1 AND content IS ?",
+            (_scrub_surrogates(payload['api_content']), _row_id(payload), session_id,
+             db._encode_content(payload['content']))).rowcount}
+    return {'value': _merge_worker_api_content(db, conn, session_id, payload, _row_id(payload))}
 
 
 def worker_user_content(db, conn, session_id, payload):

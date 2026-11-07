@@ -65,6 +65,18 @@ def test_worker_route_and_api_content_preserve_exact_usage_and_target_fences(tmp
         assert store.set_latest_user_api_content('owned', [{'type': 'text', 'text': 'visible'}], 'wire-only') == 1
         with db._read_ctx() as conn:
             assert conn.execute('SELECT api_content FROM messages WHERE session_id=?', ('owned',)).fetchone()[0] == 'wire-only'
+            row_id = conn.execute('SELECT id FROM messages WHERE session_id=?', ('owned',)).fetchone()[0]
+        db._execute_write(lambda conn: conn.execute(
+            'UPDATE messages SET display_metadata=? WHERE id=?',
+            (db._encode_display_metadata({'reaction': 'keep'}), row_id)))
+        assert store.set_message_api_content(
+            'owned', row_id, [{'type': 'text', 'text': 'visible'}], 'wire-meta',
+            display_metadata={'sidecar_provenance': 'marker', 'reaction': None}) == 1
+        with db._read_ctx() as conn:
+            stored = conn.execute('SELECT api_content, display_metadata FROM messages WHERE id=?', (row_id,)).fetchone()
+        assert stored[0] == 'wire-meta'
+        assert db._decode_display_metadata(stored[1]) == {'sidecar_provenance': 'marker'}
+        with db._read_ctx() as conn:
             usage = [tuple(r) for r in conn.execute(
                 'SELECT model,billing_provider,input_tokens,output_tokens FROM session_model_usage WHERE session_id=? ORDER BY model', ('owned',))]
         assert usage == [('first', 'provider-one', 11, 7), ('second', 'provider-two', 13, 3)]

@@ -62,16 +62,21 @@ class RuntimeSessionLifecycleMixin:
         self._apply('session.billing_route', {'provider': provider, 'base_url': base_url,
                                               'billing_mode': billing_mode})
 
-    def set_latest_user_api_content(self, session_id, content, api_content):
+    def set_latest_user_api_content(self, session_id, content, api_content, *, display_metadata=None):
         self._session(session_id)
-        return self._apply('session.api_content', {'content': content, 'api_content': api_content})['value']
+        payload = {'content': content, 'api_content': api_content}
+        if display_metadata is not None:
+            payload['display_metadata'] = display_metadata
+        return self._apply('session.api_content', payload)['value']
 
     # The turn prologue's row-addressed backfills (agent/turn_context.py) for a user row another
     # writer materialized first (in-place preflight compaction, an early flush, a submit-time row).
-    def set_message_api_content(self, session_id, row_id, content, api_content):
+    def set_message_api_content(self, session_id, row_id, content, api_content, *, display_metadata=None):
         self._session(session_id)
-        return self._apply('session.message_api_content',
-                           {'row_id': row_id, 'content': content, 'api_content': api_content})['value']
+        payload = {'row_id': row_id, 'content': content, 'api_content': api_content}
+        if display_metadata is not None:
+            payload['display_metadata'] = display_metadata
+        return self._apply('session.message_api_content', payload)['value']
 
     def set_user_message_content(self, session_id, row_id, content, display_metadata=None):
         self._session(session_id)
