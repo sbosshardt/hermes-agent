@@ -1485,6 +1485,7 @@ class _LoopState:
     # a consecutive-ineffective-attempt backstop, rearmed only after a provider response
     # reports a prompt below threshold.
     max_compression_attempts: Any
+    preflight_compressed: bool = False
     api_call_count: int = 0
     final_response: Any = None
     interrupted: bool = False
@@ -1630,6 +1631,9 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
         user_message=s.user_message, original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,
         should_review_memory=s._should_review_memory, turn_id=s.turn_id,
+        ext_prefetch_cache=s._ext_prefetch_cache, plugin_user_context=s._plugin_user_context,
+        current_turn_user_idx=s.current_turn_user_idx,
+        preflight_compressed=s.preflight_compressed is True,
     )
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):
@@ -1738,6 +1742,7 @@ def _run_conversation_turn(
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
+        preflight_compressed=getattr(_ctx, "preflight_compressed", False) is True,
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
     if (early_result := _turn_without_loop(agent, s, _ctx.plugin_block_message)) is not None:

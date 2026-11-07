@@ -509,6 +509,7 @@ class TurnContext:
     plugin_block_message: str = ""  # ``pre_llm_call`` veto: the turn ends with this, no inference
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
+    preflight_compressed: bool = False  # this turn's actual compaction outcome, not historical agent state
 
 
 def _persist_under_lock(agent: Any, fn, failure_msg: str, pending_cli_message: Any) -> None:
@@ -1029,13 +1030,88 @@ def _memory_turn_start_and_prefetch(
     return ext_prefetch_cache
 
 
+def _clear_codex_sidecar_stamp(msg: dict[str, Any]) -> None:
+    """A new submission cannot inherit recovery authority from a previous attempt."""
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY
+    msg.pop("api_content", None)
+    msg.pop("_codex_input_accepted", None)
+    metadata = msg.get("display_metadata")
+    if isinstance(metadata, dict) and SIDECAR_PROVENANCE_KEY in metadata:
+        msg["display_metadata"] = {k: v for k, v in metadata.items() if k != SIDECAR_PROVENANCE_KEY}
+
+
+def _stamp_acknowledged_codex_sidecar(
+    agent: Any, msg: dict[str, Any], wire_content: str, *, preflight_compressed: bool,
+) -> None:
+    """Attach accepted current suffix, never historical seed, to one exact row."""
+    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
+    from agent.memory_context import sanitize_context
+    from agent.session_persistence import _persist_lock, durable_user_row_content
+    with _persist_lock(agent):
+        _clear_codex_sidecar_stamp(msg)
+        content = msg.get("content")
+        if msg.get("role") != "user" or not isinstance(content, str):
+            return
+        session_id = getattr(agent, "session_id", None)
+        if msg.get("_submit_row_session_id", session_id) != session_id:
+            return
+        durable, _ = durable_user_row_content(agent, msg, content, None, infer_api_content=False)
+        if preflight_compressed is True and getattr(agent, "_last_compaction_in_place", False) is True:
+            # Native compaction writes the live copy, not the normal flush override.
+            durable = content
+        if not isinstance(durable, str):
+            return
+        api_content = None if wire_content == sanitize_context(durable).strip() else wire_content
+        marker = sidecar_provenance(durable, api_content) if api_content is not None else None
+        db, row_id = getattr(agent, "_session_db", None), msg.get("_row_id")
+        if "_row_id" in msg and (isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0):
+            return
+        if db is not None and isinstance(row_id, int):
+            try:
+                if db.set_message_api_content(session_id, row_id, durable, api_content,
+                                              display_metadata={SIDECAR_PROVENANCE_KEY: marker}) != 1:
+                    logger.warning("Acknowledged Codex sidecar matched no exact row for session=%s", session_id or "none")
+                    return
+            except Exception:
+                logger.warning("Acknowledged Codex sidecar backfill failed for session=%s", session_id or "none", exc_info=True)
+                return
+        elif db is not None and "_row_id" not in msg and (
+            preflight_compressed is True
+            and getattr(agent, "_last_compaction_in_place", False) is True
+            and msg.get("_db_persisted") is True
+        ):
+            try:
+                if db.set_latest_user_api_content(
+                    session_id, durable, api_content,
+                    display_metadata={SIDECAR_PROVENANCE_KEY: marker},
+                ) != 1:
+                    logger.warning("Acknowledged Codex sidecar matched no compacted row for session=%s", session_id or "none")
+                    return
+            except Exception:
+                logger.warning("Acknowledged Codex sidecar backfill failed for session=%s", session_id or "none", exc_info=True)
+                return
+        elif db is not None and msg.get("_db_persisted"):
+            # Neither a lost id nor equal text authorizes a positional rewrite.
+            return
+        msg["_codex_input_accepted"] = True
+        if api_content is not None:
+            msg["api_content"] = api_content
+            metadata = msg.get("display_metadata")
+            msg["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}),
+                                       SIDECAR_PROVENANCE_KEY: marker}
+
+
 def _stamp_api_content_sidecar(
     agent: Any, messages: list[Any], current_turn_user_idx: int, ext_prefetch_cache: str,
-    plugin_user_context: str, *, preflight_compressed: bool,
+    plugin_user_context: str, *, preflight_compressed: bool, wire_content: Optional[str] = None,
 ) -> None:
     """api_content sidecar — persist what you send: injected context lives only in the
     API copy, so stamp the exact sent bytes on the live dict for replay."""
     _turn_user_msg = messages[current_turn_user_idx]
+    if wire_content is not None:
+        _stamp_acknowledged_codex_sidecar(agent, _turn_user_msg, wire_content,
+                                          preflight_compressed=preflight_compressed)
+        return
     live_content = _turn_user_msg.get("content")
     from agent.session_persistence import _persist_lock, durable_user_row_content
     # Match the row the flush wrote (persist override = clean transcript), not the live bytes.
@@ -1329,6 +1405,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context, plugin_block_message=plugin_block_message,
         ext_prefetch_cache=ext_prefetch_cache, preflight_compression_blocked=compaction.blocked,
+        preflight_compressed=compaction.compressed is True,
     )
 
 

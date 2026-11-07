@@ -14,7 +14,10 @@ from typing import Any
 class SessionApiContentMixin:
     """``SessionDB`` mixin: the ``api_content`` sidecar backfills."""
 
-    def set_latest_user_api_content(self, session_id: str, content: Any, api_content: str) -> int:
+    def set_latest_user_api_content(
+        self, session_id: str, content: Any, api_content: str | None,
+        *, display_metadata: dict[str, Any] | None = None,
+    ) -> int:
         """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row (0/1 rows). Preflight compaction
         inserts that row BEFORE the sidecar exists and the later persist identity-skips compacted dicts;
         without this a reload reopens the prompt-cache divergence. ``content`` match guards a racing rewrite.
@@ -32,6 +35,11 @@ class SessionApiContentMixin:
         instead — it addresses the exact row and cannot land on a neighbour.
         """
         from hermes_state_messages import _scrub_surrogates
+        if display_metadata is not None:
+            if not session_id:
+                return 0
+            return self._merge_acknowledged_api_content(
+                session_id, None, content, api_content, display_metadata)
         return self._write_rowcount(
             "UPDATE messages SET api_content = ? WHERE id = (SELECT id FROM messages "
             "WHERE session_id = ? AND role = 'user' AND active = 1 ORDER BY id DESC LIMIT 1"
@@ -39,7 +47,8 @@ class SessionApiContentMixin:
             (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
 
     def set_message_api_content(
-        self, session_id: str, row_id: int, content: Any, api_content: str
+        self, session_id: str, row_id: int, content: Any, api_content: str | None,
+        *, display_metadata: dict[str, Any] | None = None,
     ) -> int:
         """Backfill the ``api_content`` sidecar onto ONE known durable row.
 
@@ -61,7 +70,53 @@ class SessionApiContentMixin:
         from hermes_state_messages import _scrub_surrogates
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
-        return self._write_rowcount(
-            "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
-            "AND role = 'user' AND active = 1 AND content IS ?",
-            (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
+        if display_metadata is None:
+            return self._write_rowcount(
+                "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
+                "AND role = 'user' AND active = 1 AND content IS ?",
+                (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
+        return self._merge_acknowledged_api_content(
+            session_id, row_id, content, api_content, display_metadata)
+
+    def _merge_acknowledged_api_content(self, session_id: str, row_id: int | None, content: Any,
+                                        api_content: str | None, patch: dict[str, Any]) -> int:
+        """Read/merge/write under one native transaction; never replace concurrent reactions."""
+        from hermes_state_messages import _scrub_surrogates
+
+        def _write(conn):
+            if row_id is None:
+                # Only the explicitly claimed in-place compaction caller uses this path.
+                # Resolve the newest active user row INSIDE the write transaction.
+                row = conn.execute(
+                    "SELECT id, display_metadata FROM messages WHERE session_id = ? "
+                    "AND role = 'user' AND active = 1 ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if row is None or conn.execute(
+                    "SELECT 1 FROM messages WHERE id = ? AND content IS ?",
+                    (row[0], self._encode_content(content)),
+                ).fetchone() is None:
+                    return 0
+                target_id, stored_metadata = row
+            else:
+                row = conn.execute(
+                    "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ? "
+                    "AND role = 'user' AND active = 1 AND content IS ?",
+                    (row_id, session_id, self._encode_content(content)),
+                ).fetchone()
+                if row is None:
+                    return 0
+                target_id, stored_metadata = row_id, row[0]
+            metadata = self._decode_display_metadata(stored_metadata) or {}
+            metadata.update({key: value for key, value in patch.items() if value is not None})
+            for key, value in patch.items():
+                if value is None:
+                    metadata.pop(key, None)
+            return conn.execute(
+                "UPDATE messages SET api_content = ?, display_metadata = ? WHERE id = ? "
+                "AND session_id = ? AND role = 'user' AND active = 1 AND content IS ?",
+                (_scrub_surrogates(api_content), self._encode_display_metadata(metadata) if metadata else None,
+                 target_id, session_id, self._encode_content(content)),
+            ).rowcount
+
+        return self._execute_write(_write)

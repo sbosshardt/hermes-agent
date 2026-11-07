@@ -1592,7 +1592,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # build's) needs the index, so rows this build wrote never pay for it. Indexed in order: same shadowing.
         unindexed_tool_owners: list[dict[str, Any]] = []
         for row in rows:
-            content = self._loaded_view_content(row["role"], self._decode_content(row["content"]))
+            raw_content = self._decode_content(row["content"])
+            content = self._loaded_view_content(row["role"], raw_content)
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).
             msg = {"role": row["role"], "content": content, _DB_PERSISTED_MARKER_KEY: True}
@@ -1612,6 +1613,19 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded
                 lift_data_use(msg)
+                # Authenticate the marker against the RAW stored bytes before load-time
+                # sanitization; only then rebind it to the normalized view used by the
+                # one-shot history renderer. A rewritten row must lose its old authority.
+                if row["role"] == "user":
+                    from agent.codex_runtime_history_seed import SIDECAR_PROVENANCE_KEY, sidecar_provenance
+                    marker = decoded.get(SIDECAR_PROVENANCE_KEY)
+                    sidecar = row["api_content"]
+                    if marker is not None:
+                        decoded.pop(SIDECAR_PROVENANCE_KEY, None)
+                        if (isinstance(raw_content, str) and isinstance(content, str)
+                                and isinstance(sidecar, str) and isinstance(marker, str)
+                                and marker == sidecar_provenance(raw_content, sidecar)):
+                            decoded[SIDECAR_PROVENANCE_KEY] = sidecar_provenance(content, sidecar)
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(

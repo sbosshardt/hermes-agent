@@ -1,29 +1,24 @@
 """A codex app-server thread started from scratch is seeded with the session's prior turns (#26035, #74712).
 
 Direction from #26081 (@LeonSGP43). A resumed codex thread already holds the conversation, so only a
-fresh ``thread/start`` carries the seed, and the recorded prompt composition stays the bare prompt so
-the seed never makes the next turn retire the thread.
+fresh thread carries the seed in its first accepted lower-trust user input, never persistent developer
+instructions. The recorded prompt composition stays bare so the next turn does not retire the thread.
 """
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent import codex_runtime
 from agent.transports import codex_app_server_session as sess_mod
+from tests.agent._local_codex_carry_helpers import InertPeer, bounded_turn, inert_codex_boundaries
+
+pytestmark = pytest.mark.usefixtures("inert_codex_boundaries")
 
 
-class _FakeClient:
+class _FakeClient(InertPeer):
     def __init__(self, **_kw):
-        self.requests = []
-
-    def close(self):
-        pass
-
-    def initialize(self, **_kw):
-        return {}
-
-    def request(self, method, params=None, timeout=None):
-        self.requests.append((method, params))
-        return {"thread": {"id": (params or {}).get("threadId", "fresh")}}
+        super().__init__()
 
 
 def _agent(**overrides):
@@ -49,12 +44,16 @@ def test_fresh_thread_is_seeded_with_prior_turns_but_not_the_current_one(monkeyp
     codex_runtime._ensure_codex_session(agent, _HISTORY)
     agent._codex_session.ensure_started()
     (_, params), = [(m, p) for (m, p) in client.requests if m == "thread/start"]
-    instructions = params["developerInstructions"]
-    assert instructions.startswith("SOUL: you are Hermes")
-    assert "my dog is called Shadow" in instructions and "Noted: Shadow." in instructions
-    assert "called tools: memory" in instructions and "saved" in instructions
-    assert "what is my dog called?" not in instructions
-    assert instructions.count("SOUL: you are Hermes") == 1  # system rows are not re-rendered as history
+    assert params["developerInstructions"] == "SOUL: you are Hermes"
+    first = bounded_turn(agent._codex_session, "what is my dog called?")
+    assert first.input_accepted is True
+    history, current = first.submitted_user_text.rsplit("\n\n[CURRENT USER TURN]\n", 1)
+    assert "my dog is called Shadow" in history and "Noted: Shadow." in history
+    assert "called tools: memory" in history and "saved" in history
+    assert "what is my dog called?" not in history
+    assert "SOUL: you are Hermes" not in history
+    assert current == "what is my dog called?"
+    assert bounded_turn(agent._codex_session, "next question").submitted_user_text == "next question"
     # The seed is not part of the recorded composition: the next turn keeps the thread.
     assert agent._codex_session_prompt == "SOUL: you are Hermes"
     codex_runtime._ensure_codex_session(agent, _HISTORY + [{"role": "assistant", "content": "Shadow"}])
@@ -73,13 +72,14 @@ def test_resumed_thread_gets_no_seed_but_a_failed_resume_fallback_does(monkeypat
     assert "my dog is called Shadow" not in resume_params.get("developerInstructions", "")
 
     failing = _FakeClient()
-    failing.request = lambda method, params=None, timeout=None: (
-        (_ for _ in ()).throw(sess_mod.CodexAppServerError(code=-32602, message="unknown thread"))
-        if method == "thread/resume" else (failing.requests.append((method, params)) or {"thread": {"id": "fresh"}})
-    )
+    failing.resume_fails = True
     monkeypatch.setattr(sess_mod, "CodexAppServerClient", lambda **kw: failing)
     agent = _agent(_session_db=db, session_id="s1", _emit_diagnostic_status=lambda *_: None)
     codex_runtime._ensure_codex_session(agent, _HISTORY)
-    assert codex_runtime._start_codex_thread(agent) == "fresh"
+    assert codex_runtime._start_codex_thread(agent) == "fresh-thread"
     (_, start_params), = [(m, p) for (m, p) in failing.requests if m == "thread/start"]
-    assert "my dog is called Shadow" in start_params["developerInstructions"]
+    assert start_params["developerInstructions"] == "SOUL: you are Hermes"
+    first = bounded_turn(agent._codex_session, "what is my dog called?")
+    assert first.input_accepted is True and "my dog is called Shadow" in first.submitted_user_text
+    assert first.submitted_user_text.endswith("\n\n[CURRENT USER TURN]\nwhat is my dog called?")
+    assert bounded_turn(agent._codex_session, "next question").submitted_user_text == "next question"
